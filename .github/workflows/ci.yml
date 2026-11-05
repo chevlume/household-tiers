@@ -25,7 +25,8 @@ jobs:
           "$HOME/.local/bin/uv" pip install --python .venv/bin/python pytest
 
       - name: pytest
-        run: "$RUNNER_TEMP/hermes-agent/.venv/bin/python" -m pytest -q
+        run: |
+          "$RUNNER_TEMP/hermes-agent/.venv/bin/python" -m pytest -q
 
       - name: hermes plugins validate and doctor
         run: |
