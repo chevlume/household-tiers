@@ -43,6 +43,19 @@ def test_unknown_sender_after_messaging_is_guest(ht, home, monkeypatch):
     assert (tier, who) == ("guest", "unknown")
 
 
+def test_desktop_and_tui_without_a_sender_are_guest_after_messaging(ht, home, monkeypatch):
+    """A local Desktop or TUI turn has no messaging sender once chat has been served."""
+    _family(home)
+    assert ht._identity("desktop-before") == ("owner", "local")
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "222")
+    ht._identity("chat")
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM")
+    monkeypatch.delenv("HERMES_SESSION_USER_ID")
+    assert ht._identity("desktop-after") == ("guest", "unknown")
+    assert ht._identity("tui-after") == ("guest", "unknown")
+
+
 def test_cron_defaults_to_owner(ht, home, monkeypatch):
     _family(home)
     monkeypatch.setenv("HERMES_CRON_SESSION", "1")

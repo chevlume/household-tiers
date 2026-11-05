@@ -245,6 +245,38 @@ def test_real_system_prompt_keeps_sections_after_memory(kid, home, monkeypatch):
     assert "web_search" in _names(out)
 
 
+def test_entry_split_does_not_use_memory_store_parse(kid, home, monkeypatch):
+    """A core refactor of MemoryStore._parse_entries must not drop entry text."""
+    from tools.memory_tool_store import ENTRY_DELIMITER, MemoryStore
+
+    secret = "code § 12345"
+    later = "LATER_DELIMITER_ENTRY"
+    root = home / "memories"
+    root.mkdir(parents=True)
+    (root / "MEMORY.md").write_text(ENTRY_DELIMITER.join([secret, later]), encoding="utf-8")
+    calls = {"n": 0}
+
+    def empty(raw):
+        calls["n"] += 1
+        return []
+
+    monkeypatch.setattr(MemoryStore, "_parse_entries", staticmethod(empty))
+    sep = "═" * 46
+    system = (
+        f"You are Hermes.\n\n{sep}\nMEMORY (your personal notes)\n{sep}\n{secret}\n§\n{later}\n\n"
+        f"# Hermes runtime environment\nskill text {secret}"
+    )
+    out = kid._llm_request(
+        request={"messages": [{"role": "system", "content": system}, {"role": "user", "content": "hello"}]},
+        session_id="split",
+    )["request"]
+    blob = json.dumps(out, ensure_ascii=False)
+    assert calls["n"] == 0
+    assert secret not in blob
+    assert later not in blob
+    assert "# Hermes runtime environment" in blob
+
+
 def test_quoted_memory_header_does_not_refuse_the_turn(kid, home):
     request = {
         "messages": [
