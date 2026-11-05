@@ -178,6 +178,79 @@ def main() -> int:
             }),
         }
 
+        # Multi-paragraph entries joined with §, through the real transports.
+        from agent.prompt_caching import apply_anthropic_cache_control
+        from agent.transports import get_transport
+        from tools.memory_tool_store import MemoryStore
+
+        second = "SECOND_PARAGRAPH_BENCH"
+        later = "LATER_ENTRY_BENCH"
+        profile_b = "PROFILE_SECOND_BENCH"
+        store = MemoryStore(memory_char_limit=8000, user_char_limit=8000)
+        store.add("memory", f"FIRST_LINE_BENCH\n\n{second}")
+        store.add("memory", later)
+        store.add("user", f"PROFILE_FIRST_BENCH\n\n{profile_b}")
+        store.load_from_disk()
+        multi = "\n\n".join([
+            "You are Hermes.",
+            store.format_for_system_prompt("memory"),
+            store.format_for_system_prompt("user"),
+            "Conversation started: Thursday",
+        ])
+        multi_messages = [{"role": "system", "content": multi}, {"role": "user", "content": "hello"}]
+        cached = apply_anthropic_cache_control(multi_messages)
+        built = {
+            "chat_completions": get_transport("chat_completions").build_kwargs("gpt-4o", multi_messages, unfiltered),
+            "anthropic_messages": get_transport("anthropic_messages").build_kwargs(
+                "claude-sonnet-4-5", multi_messages, unfiltered
+            ),
+            "codex_responses": get_transport("codex_responses").build_kwargs(
+                "gpt-5-codex", multi_messages, unfiltered
+            ),
+            "bedrock_converse": get_transport("bedrock_converse").build_kwargs(
+                "anthropic.claude-sonnet-4-5-20250929-v1:0", multi_messages, unfiltered
+            ),
+            "openrouter_cache": get_transport("chat_completions").build_kwargs(
+                "anthropic/claude-sonnet-4.5", cached, unfiltered, is_openrouter=True
+            ),
+        }
+        multiparagraph = {}
+        for mode, built_request in built.items():
+            cleaned = plugin._llm_request(request=built_request, session_id="multi")["request"]
+            blob = json.dumps(cleaned, ensure_ascii=False, default=str)
+            def _collect(node, found):
+                if isinstance(node, dict):
+                    spec = node.get("toolSpec")
+                    if isinstance(spec, dict) and spec.get("name"):
+                        found.append(spec["name"])
+                    function = node.get("function")
+                    if isinstance(function, dict) and function.get("name"):
+                        found.append(function["name"])
+                    elif isinstance(node.get("name"), str) and (
+                        "input_schema" in node or node.get("type") == "function" or "parameters" in node
+                    ):
+                        found.append(node["name"])
+                    for value in node.values():
+                        _collect(value, found)
+                elif isinstance(node, list):
+                    for item in node:
+                        _collect(item, found)
+
+            names = []
+            _collect(cleaned.get("tools"), names)
+            _collect(cleaned.get("toolConfig"), names)
+            ordered = []
+            for name in names:
+                if name not in ordered:
+                    ordered.append(name)
+            multiparagraph[mode] = {
+                "second_paragraph": second in blob,
+                "later_entry": later in blob,
+                "profile_second": profile_b in blob,
+                "visible_tools": ordered,
+                "refused": "policy error" in blob,
+            }
+
         (home / "household-tiers.json").write_text("{ broken", encoding="utf-8")
         broken = plugin._llm_request(request=secret_request, session_id="broken")
         broken_blob = json.dumps(broken["request"])
@@ -292,6 +365,7 @@ def main() -> int:
             "restricted_prompt_owner_markers_before": before,
             "restricted_prompt_owner_markers_after": restricted_leaks,
             "shapes": shapes,
+            "multiparagraph": multiparagraph,
             "restricted_prompt_memory_context_tags_after": recall_leaks,
             "broken_config_owner_markers": broken_leaks,
             "broken_config_tools": broken_tools,

@@ -89,9 +89,11 @@ _AUDIT_FIELDS = ("decision", "who", "tier", "tool", "why", "session", "window", 
 _WHY = {"private_url", "private_path", "policy_error", "tool_denied", "shared_thread", "curfew", "tier_change", "forget"}
 _TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}\Z")
 _HEADER_MARKERS = ("MEMORY (your personal notes)", "USER PROFILE (who the user is)")
-_MEM_BLOCK = re.compile(
-    r"═+\n(?:MEMORY \(your personal notes\)|USER PROFILE \(who the user is\))[^\n]*\n═+\n.*?(?=\n\n|\Z)",
-    re.S,
+# Hermes renders a memory block as a boxed header plus entries joined by §,
+# and entries may contain blank lines. The block runs until the next boxed
+# header or the end of that string. A blank line is not the end.
+_BLOCK_OPEN = re.compile(
+    r"═{10,}\n(?:MEMORY \(your personal notes\)|USER PROFILE \(who the user is\))[^\n]*\n═{10,}\n"
 )
 _RECALL = re.compile(r"<\s*memory-context\s*>[\s\S]*?</\s*memory-context\s*>", re.I)
 _EMBEDDED_IP = re.compile(r"(?:\d{1,3}[.-]){3}\d{1,3}")
@@ -504,32 +506,48 @@ def _private_url(tool_name: str, args, tier: str, pol: dict) -> bool:
     return any(_host_is_local(_url_host(url)) for url in urls)
 
 
-def _under_hermes_home(path_str: str) -> bool:
-    home = _home().resolve()
+def _session_base(task_id: str) -> Path:
+    """Same base Hermes file tools use: session dir, then TERMINAL_CWD, then cwd."""
     try:
-        candidate = Path(os.path.expanduser(path_str or ".")).expanduser()
+        from tools.file_tools_paths import _resolve_base_dir
+
+        return Path(_resolve_base_dir(task_id or ""))
+    except Exception:
+        return Path.cwd()
+
+
+def _same_or_under(child: Path, parent: Path) -> bool:
+    child_s = os.path.normcase(os.path.abspath(child))
+    parent_s = os.path.normcase(os.path.abspath(parent))
+    if child_s == parent_s:
+        return True
+    prefix = parent_s if parent_s.endswith(os.sep) else parent_s + os.sep
+    return child_s.startswith(prefix)
+
+
+def _under_hermes_home(path_str: str, task_id: str = "") -> bool:
+    home = _home()
+    try:
+        home = home.resolve()
+    except OSError:
+        pass
+    try:
+        candidate = Path(os.path.expanduser(str(path_str or "."))).expanduser()
         if not candidate.is_absolute():
-            candidate = Path.cwd() / candidate
-        resolved = candidate.resolve()
+            candidate = _session_base(task_id) / candidate
+        resolved = candidate.resolve() if candidate.exists() else candidate
     except Exception:
         return True
-    try:
-        resolved.relative_to(home)
+    if _same_or_under(resolved, home):
         return True
-    except ValueError:
-        pass
     # A search rooted above the household directory would walk into it.
-    try:
-        home.relative_to(resolved)
-    except ValueError:
-        return False
-    return True
+    return _same_or_under(home, resolved)
 
 
-def _sensitive_file_args(args) -> bool:
+def _sensitive_file_args(args, task_id: str = "") -> bool:
     paths: list[str] = []
     data = args if isinstance(args, dict) else {}
-    for key in ("path", "file", "directory", "root"):
+    for key in ("path", "file", "file_path", "directory", "root", "target"):
         value = data.get(key)
         if isinstance(value, str):
             paths.append(value)
@@ -537,7 +555,7 @@ def _sensitive_file_args(args) -> bool:
             paths.extend(item for item in value if isinstance(item, str))
     if not paths:
         paths = ["."]
-    return any(_under_hermes_home(path) for path in paths)
+    return any(_under_hermes_home(path, task_id) for path in paths)
 
 
 def _pre_tool_call(tool_name: str = "", args=None, session_id: str = "", **kwargs):
@@ -545,7 +563,7 @@ def _pre_tool_call(tool_name: str = "", args=None, session_id: str = "", **kwarg
         tier, who = _identity(session_id)
         pol = _policy()
         if _allowed(tier, tool_name, pol):
-            if "*" not in pol["tiers"].get(tier, []) and tool_name in _FILE_TOOLS and _sensitive_file_args(args):
+            if "*" not in pol["tiers"].get(tier, []) and tool_name in _FILE_TOOLS and _sensitive_file_args(args, str(kwargs.get("task_id") or "")):
                 _audit(pol, decision="block", who=who, tier=tier, tool=tool_name, why="private_path")
                 return {"action": "block", "message": _msg(pol, "path_blocked", who=who, tier=tier, tool=tool_name)}
             if _private_url(tool_name, args, tier, pol):
@@ -572,21 +590,77 @@ def _replace(pattern: re.Pattern, repl: str, text: str) -> tuple[str, int]:
     return pattern.subn(lambda _match: repl, text)
 
 
-def _clean_text(text: str, repl_mem: str, repl_recall: str) -> tuple[str, int]:
-    text, memory_hits = _replace(_MEM_BLOCK, repl_mem, text)
+def _memory_chunks(body: str) -> list[str]:
+    """Distinctive pieces of a memory block: § entries and their paragraphs."""
+    found: list[str] = []
+    for entry in body.split("\n§\n"):
+        entry = entry.strip()
+        pieces = [entry] if entry else []
+        pieces.extend(part.strip() for part in re.split(r"\n\s*\n", entry) if part.strip())
+        for piece in pieces:
+            if len(piece) >= 8 and piece not in found:
+                found.append(piece)
+    return found
+
+
+def _strip_memory_blocks(text: str, repl: str) -> tuple[str, int, list[str]]:
+    hidden = 0
+    chunks: list[str] = []
+    out: list[str] = []
+    pos = 0
+    while pos < len(text):
+        match = _BLOCK_OPEN.search(text, pos)
+        if not match:
+            out.append(text[pos:])
+            break
+        out.append(text[pos:match.start()])
+        nxt = _BLOCK_OPEN.search(text, match.end())
+        end = nxt.start() if nxt else len(text)
+        chunks.extend(_memory_chunks(text[match.end():end]))
+        out.append(repl)
+        hidden += 1
+        pos = end
+    return "".join(out), hidden, chunks
+
+
+def _store_chunks() -> list[str]:
+    """Entry text currently in the owner's memory files, when those files exist."""
+    try:
+        from tools.memory_tool import get_memory_dir
+        from tools.memory_tool_store import MemoryStore
+    except Exception:
+        return []
+    chunks: list[str] = []
+    root = get_memory_dir()
+    for name in ("MEMORY.md", "USER.md"):
+        path = root / name
+        if not path.is_file():
+            continue
+        try:
+            raw = path.read_text(encoding="utf-8-sig")
+        except OSError:
+            continue
+        for entry in MemoryStore._parse_entries(raw):
+            chunks.extend(_memory_chunks(entry))
+    return chunks
+
+
+def _clean_text(text: str, repl_mem: str, repl_recall: str, chunks: list[str]) -> tuple[str, int]:
+    text, memory_hits, found = _strip_memory_blocks(text, repl_mem)
+    chunks.extend(found)
     text, recall_hits = _replace(_RECALL, repl_recall, text)
     return text, memory_hits + recall_hits
 
 
-def _clean_obj(obj, repl_mem: str, repl_recall: str):
+def _clean_obj(obj, repl_mem: str, repl_recall: str, chunks: list[str]):
     """Copy *obj*, stripping memory blocks and recalls from every string."""
     if isinstance(obj, str):
-        return _clean_text(obj, repl_mem, repl_recall)
+        return _clean_text(obj, repl_mem, repl_recall, chunks)
     if isinstance(obj, list):
         cleaned = []
         hidden = 0
         for item in obj:
-            new_item, count = _clean_obj(item, repl_mem, repl_recall)
+            new_item, count = _clean_obj(item, repl_mem, repl_recall, chunks)
             hidden += count
             cleaned.append(new_item)
         return cleaned, hidden
@@ -594,30 +668,83 @@ def _clean_obj(obj, repl_mem: str, repl_recall: str):
         cleaned = {}
         hidden = 0
         for key, value in obj.items():
-            new_value, count = _clean_obj(value, repl_mem, repl_recall)
+            new_value, count = _clean_obj(value, repl_mem, repl_recall, chunks)
             hidden += count
             cleaned[key] = new_value
         return cleaned, hidden
     return obj, 0
 
 
-def _headers_remain(req) -> bool:
+def _walk_strings(obj, found: list[str]) -> None:
+    if isinstance(obj, str):
+        found.append(obj)
+    elif isinstance(obj, dict):
+        for value in obj.values():
+            _walk_strings(value, found)
+    elif isinstance(obj, list):
+        for value in obj:
+            _walk_strings(value, found)
+
+
+def _memory_files_text() -> str:
     try:
-        blob = json.dumps(req, ensure_ascii=False, default=str)
+        from tools.memory_tool import get_memory_dir
     except Exception:
+        return ""
+    parts = []
+    root = get_memory_dir()
+    for name in ("MEMORY.md", "USER.md"):
+        path = root / name
+        if not path.is_file():
+            continue
+        try:
+            parts.append(path.read_text(encoding="utf-8-sig"))
+        except OSError:
+            continue
+    return "\n".join(parts)
+
+
+def _owner_memory_remains(req, chunks: list[str]) -> bool:
+    """True when a real memory block or its entry text is still in the payload.
+
+    A quoted header with no boxed block and no stored entry text does not count.
+    """
+    texts: list[str] = []
+    _walk_strings(req, texts)
+    if any(_BLOCK_OPEN.search(text) for text in texts):
         return True
-    return any(marker in blob for marker in _HEADER_MARKERS)
+    blob = "\n".join(texts)
+    raw = _memory_files_text()
+    watched: list[str] = []
+    for piece in list(chunks) + _store_chunks():
+        if piece in watched:
+            continue
+        # Ignore prompt tails that were only inside the stripped span (the
+        # timestamp Hermes joins after the last block). Real entries are in
+        # the memory files. With no files, every extracted piece counts.
+        if raw and piece not in raw:
+            continue
+        watched.append(piece)
+    return any(piece in blob for piece in watched)
 
 
 def _tool_name(tool) -> str:
-    """OpenAI nested name, or the top-level name Anthropic and Codex use."""
+    """OpenAI nested name, Anthropic/Codex top-level name, or Bedrock toolSpec name."""
     if not isinstance(tool, dict):
         return ""
+    spec = tool.get("toolSpec")
+    if isinstance(spec, dict) and isinstance(spec.get("name"), str) and spec["name"]:
+        return spec["name"]
     function = tool.get("function")
     if isinstance(function, dict) and isinstance(function.get("name"), str) and function["name"]:
         return function["name"]
     name = tool.get("name")
     return name if isinstance(name, str) else ""
+
+
+def _is_tool_marker(tool) -> bool:
+    """Bedrock cachePoint and similar markers are not callable tools."""
+    return isinstance(tool, dict) and "cachePoint" in tool and "toolSpec" not in tool
 
 
 def _append_note(req: dict, text: str) -> bool:
@@ -666,6 +793,38 @@ def _refusal_request(req: dict, refusal: str) -> dict:
     return out
 
 
+def _filter_tool_lists(req: dict, tier: str, pol: dict):
+    """Drop disallowed tools from every provider list this payload uses.
+
+    Returns how many tools remain, or None when the payload has no tool list.
+    """
+    visible = None
+    lists = []
+    tools = req.get("tools")
+    if isinstance(tools, list):
+        lists.append(("tools", tools))
+    config = req.get("toolConfig")
+    if isinstance(config, dict) and isinstance(config.get("tools"), list):
+        lists.append(("toolConfig", config["tools"]))
+    if not lists:
+        return None
+    for key, tools in lists:
+        kept = [tool for tool in tools if _is_tool_marker(tool) or _allowed(tier, _tool_name(tool), pol)]
+        callable_kept = [tool for tool in kept if not _is_tool_marker(tool)]
+        visible = len(callable_kept)
+        if key == "tools":
+            if kept:
+                req["tools"] = kept
+            else:
+                req.pop("tools", None)
+                req.pop("tool_choice", None)
+        elif callable_kept:
+            config["tools"] = kept
+        else:
+            req.pop("toolConfig", None)
+    return visible
+
+
 def _llm_result(req: dict, reason: str) -> dict:
     return {"request": req, "source": PLUGIN_NAME, "reason": reason}
 
@@ -681,9 +840,10 @@ def _llm_request(**kwargs):
             return None
         repl_mem = _msg(pol, "memory_withheld")
         repl_recall = _msg(pol, "recall_withheld")
+        chunks: list[str] = []
         if tier not in pol["memory_tiers"]:
-            req, hidden = _clean_obj(request, repl_mem, repl_recall)
-            if _headers_remain(req):
+            req, hidden = _clean_obj(request, repl_mem, repl_recall, chunks)
+            if _owner_memory_remains(req, chunks):
                 return _llm_result(
                     _refusal_request(req, DEFAULT_MESSAGES["policy_error_tool"]),
                     f"{who} ({tier}): owner memory still present; refused",
@@ -694,18 +854,8 @@ def _llm_request(**kwargs):
         noted = False
         if isinstance(note, str) and note:
             noted = _append_note(req, "\n\n" + _msg(pol, "tier_note_prefix", tier=tier) + note)
-        tools = req.get("tools")
-        if isinstance(tools, list):
-            kept = [tool for tool in tools if _allowed(tier, _tool_name(tool), pol)]
-            if kept:
-                req["tools"] = kept
-            else:
-                req.pop("tools", None)
-                req.pop("tool_choice", None)
-            visible = len(kept)
-        else:
-            visible = None
-        if hidden or noted or isinstance(tools, list):
+        visible = _filter_tool_lists(req, tier, pol)
+        if hidden or noted or visible is not None:
             reason = f"{who} ({tier}): {hidden} memory blocks withheld"
             if visible is not None:
                 reason += f", {visible} tools visible"

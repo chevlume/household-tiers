@@ -1,6 +1,7 @@
 """The user tier can read files, but not the household directory."""
 
 import json
+import os
 
 
 def test_user_cannot_read_household_files(ht, home, monkeypatch):
@@ -27,6 +28,50 @@ def test_user_cannot_read_household_files(ht, home, monkeypatch):
     assert parent["action"] == "block"
     web = ht._pre_tool_call(tool_name="web_search", args={"query": "weather"}, session_id="u")
     assert web is None
+
+
+def test_relative_paths_follow_the_session_base_not_the_process_cwd(ht, tmp_path, monkeypatch):
+    session = tmp_path / "userhome"
+    hermes = session / ".hermes"
+    hermes.mkdir(parents=True)
+    (hermes / "household-tiers.json").write_text(
+        json.dumps({"preset": "family", "users": {"telegram:333": "user"}}),
+        encoding="utf-8",
+    )
+    (session / "projects").mkdir()
+    (session / "projects" / "readme.md").write_text("ok", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(hermes))
+    monkeypatch.setenv("TERMINAL_CWD", str(session))
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "333")
+    other = tmp_path / "other"
+    other.mkdir()
+    monkeypatch.chdir(other)
+    blocked = ht._pre_tool_call(tool_name="read_file", args={"path": ".hermes/memories/MEMORY.md"}, session_id="u")
+    assert blocked["action"] == "block"
+    omitted = ht._pre_tool_call(tool_name="search_files", args={"query": "secret"}, session_id="u")
+    assert omitted["action"] == "block"
+    dotted = ht._pre_tool_call(tool_name="search_files", args={"path": ".", "query": "secret"}, session_id="u")
+    assert dotted["action"] == "block"
+    allowed = ht._pre_tool_call(tool_name="read_file", args={"path": "projects/readme.md"}, session_id="u")
+    assert allowed is None
+
+
+def test_path_compare_uses_normcase(ht, home, monkeypatch):
+    (home / "household-tiers.json").write_text(
+        json.dumps({"preset": "family", "users": {"telegram:333": "user"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "333")
+    monkeypatch.setattr(os.path, "normcase", lambda value: value.lower() if isinstance(value, str) else value)
+    folded = str(home).swapcase()
+    blocked = ht._pre_tool_call(
+        tool_name="read_file",
+        args={"path": folded + "/memories/MEMORY.md"},
+        session_id="u",
+    )
+    assert blocked["action"] == "block"
 
 
 def test_memory_tiers_must_be_a_list(ht, home, monkeypatch):

@@ -123,18 +123,25 @@ def test_codex_instructions_and_responses_tools(ht, home, monkeypatch):
     assert out["store"] is False
 
 
-def test_leftover_memory_header_refuses_the_request(ht, home, monkeypatch):
+def test_leftover_memory_entry_refuses_the_request(ht, home, monkeypatch):
+    from tools.memory_tool_store import MemoryStore
+
     _policy(home)
     _as_kid(monkeypatch)
+    store = MemoryStore(memory_char_limit=4000, user_char_limit=4000)
+    added = store.add("memory", "LEFTOVER_ENTRY_TOKEN")
+    assert added.get("success"), added
     request = {
-        "messages": [{"role": "user", "content": "see MEMORY (your personal notes) still here"}],
+        "messages": [{"role": "user", "content": "the page quotes LEFTOVER_ENTRY_TOKEN"}],
         "tools": _openai_tools(),
     }
     out = ht._llm_request(request=request, session_id="left")["request"]
     blob = json.dumps(out)
-    assert "MEMORY (your personal notes)" not in blob
+    assert "LEFTOVER_ENTRY_TOKEN" not in blob
     assert "policy error" in blob
     assert "tools" not in out
+    still_boxed = {"messages": [{"role": "user", "content": "═" * 20 + "\nMEMORY (your personal notes) [1%]\n" + "═" * 20 + "\nkept"}]}
+    assert ht._owner_memory_remains(still_boxed, [])
 
 
 def test_hide_tools_env_cannot_disable_memory_filtering(ht, home, monkeypatch):
