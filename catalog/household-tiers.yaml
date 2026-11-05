@@ -1,6 +1,8 @@
 name: household-tiers
 repo: https://github.com/chevlume/household-tiers
-sha: "0000000000000000000000000000000000000000"
+# Pin of the plugin tree this entry describes. A later commit that only
+# updates this line is not included; set sha to the commit you submit.
+sha: "aec80a817dce2b3408149527d83da9becc90ce49"
 description: "One shared Hermes bot for a household: per-person tiers, owner memory kept out of other prompts, bedtime hours with a parent alert, a homework note, and /family."
 maintainer: chevlume
 category: platform
