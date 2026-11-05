@@ -1,0 +1,34 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv and Python 3.14
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/uv" python install 3.14
+
+      - name: Install Hermes at the pinned commit
+        run: |
+          git clone --filter=blob:none https://github.com/NousResearch/hermes-agent.git "$RUNNER_TEMP/hermes-agent"
+          git -C "$RUNNER_TEMP/hermes-agent" checkout ed1afb082eb3e46cf2edae9d8f68fb67b09ee4df
+          cd "$RUNNER_TEMP/hermes-agent"
+          "$HOME/.local/bin/uv" sync --locked --python 3.14
+          "$HOME/.local/bin/uv" pip install --python .venv/bin/python pytest
+
+      - name: pytest
+        run: "$RUNNER_TEMP/hermes-agent/.venv/bin/python" -m pytest -q
+
+      - name: hermes plugins validate and doctor
+        run: |
+          HERMES="$RUNNER_TEMP/hermes-agent/.venv/bin/hermes"
+          "$HERMES" plugins validate . --install-deps
+          "$HERMES" plugins doctor . --ci

@@ -1,0 +1,24 @@
+name: household-tiers
+repo: https://github.com/chevlume/household-tiers
+sha: "0000000000000000000000000000000000000000"
+description: "One shared Hermes bot for a household: per-person tiers, owner memory kept out of other prompts, bedtime hours with a parent alert, a homework note, and /family."
+maintainer: chevlume
+category: platform
+requires_hermes: ">=0.22.7"
+version: "0.1.0"
+known_issues:
+  - "Verified against Hermes commit ed1afb082eb3e46cf2edae9d8f68fb67b09ee4df, which reports base version 0.22.7. The >=0.22.7 floor is that release's SemVer (catalog rule 14). The v0.22.7 tag itself was not re-tested."
+  - "With plugins.isolation set to host the plugin host does not forward the per-turn sender, so household-tiers fails closed (everyone is a guest) and the parent alert is skipped. Use isolation in_process for per-person tiers."
+  - "Shared sessions (a thread with thread_sessions_per_user false, or a group with group_sessions_per_user false) carry replies to other people. Non-owner tiers are refused there by default (shared_threads refuse) and asked to use a direct message."
+  - "If household-tiers.json is unreadable, tool calls are blocked and memory blocks are withheld from every request, including the owner's, and every gateway turn gets a short error reply until the file is fixed."
+  - "HTTP redirects onto the local network, and DNS names that change address between check and connect, are not re-validated. This plugin does not resolve DNS or fetch URLs. See the README known issues."
+capabilities:
+  provides_tools: []
+  provides_hooks:
+    - pre_tool_call
+    - subagent_start
+    - pre_gateway_dispatch
+    - post_gateway_admission
+  provides_middleware:
+    - llm_request
+  requires_env: []
