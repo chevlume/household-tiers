@@ -89,12 +89,24 @@ _AUDIT_FIELDS = ("decision", "who", "tier", "tool", "why", "session", "window", 
 _WHY = {"private_url", "private_path", "policy_error", "tool_denied", "shared_thread", "curfew", "tier_change", "forget"}
 _TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}\Z")
 _HEADER_MARKERS = ("MEMORY (your personal notes)", "USER PROFILE (who the user is)")
-# Hermes renders a memory block as a boxed header plus entries joined by §,
-# and entries may contain blank lines. The block runs until the next boxed
-# header or the end of that string. A blank line is not the end.
+# Hermes renders a memory block as a boxed header plus entries joined by §.
+# Entries may contain blank lines. The block ends at the entry text from the
+# owner's files when that matches, otherwise at the next boxed header or at a
+# section Hermes joins after memory (plugin sections, profile, timestamp,
+# runtime). A blank line is not the end.
 _BLOCK_OPEN = re.compile(
     r"═{10,}\n(?:MEMORY \(your personal notes\)|USER PROFILE \(who the user is\))[^\n]*\n═{10,}\n"
 )
+# Anchors from agent/system_prompt.py volatile tier, after _memory_parts.
+_POST_MEMORY_ANCHORS = (
+    "<!-- hermes-plugin-sections:start -->",
+    "Active Hermes profile:",
+    "Conversation started:",
+    "Timezone:",
+    "# Hermes runtime environment",
+    "MEMORY PROVIDER CONTEXT:",
+)
+_INJECTED_ROLES = {"system", "developer"}
 _RECALL = re.compile(r"<\s*memory-context\s*>[\s\S]*?</\s*memory-context\s*>", re.I)
 _EMBEDDED_IP = re.compile(r"(?:\d{1,3}[.-]){3}\d{1,3}")
 # Wildcard DNS names that encode an address in the hostname. Classified locally.
@@ -516,26 +528,28 @@ def _session_base(task_id: str) -> Path:
         return Path.cwd()
 
 
-def _same_or_under(child: Path, parent: Path) -> bool:
-    child_s = os.path.normcase(os.path.abspath(child))
-    parent_s = os.path.normcase(os.path.abspath(parent))
-    if child_s == parent_s:
+def _host_realpath(path: Path) -> str:
+    """realpath, including a missing tail: symlinks in the existing prefix are followed."""
+    return os.path.normcase(os.path.realpath(os.path.expanduser(str(path))))
+
+
+def _same_or_under(child: str, parent: str) -> bool:
+    if child == parent:
         return True
-    prefix = parent_s if parent_s.endswith(os.sep) else parent_s + os.sep
-    return child_s.startswith(prefix)
+    prefix = parent if parent.endswith(os.sep) else parent + os.sep
+    return child.startswith(prefix)
 
 
 def _under_hermes_home(path_str: str, task_id: str = "") -> bool:
-    home = _home()
     try:
-        home = home.resolve()
-    except OSError:
-        pass
+        home = _host_realpath(_home())
+    except Exception:
+        return True
     try:
         candidate = Path(os.path.expanduser(str(path_str or "."))).expanduser()
         if not candidate.is_absolute():
             candidate = _session_base(task_id) / candidate
-        resolved = candidate.resolve() if candidate.exists() else candidate
+        resolved = _host_realpath(candidate)
     except Exception:
         return True
     if _same_or_under(resolved, home):
@@ -603,9 +617,50 @@ def _memory_chunks(body: str) -> list[str]:
     return found
 
 
-def _strip_memory_blocks(text: str, repl: str) -> tuple[str, int, list[str]]:
+def _disk_entries(target: str) -> list[str] | None:
+    try:
+        from tools.memory_tool import get_memory_dir
+        from tools.memory_tool_store import MemoryStore
+    except Exception:
+        return None
+    name = "USER.md" if target == "user" else "MEMORY.md"
+    path = get_memory_dir() / name
+    if not path.is_file():
+        return None
+    try:
+        raw = path.read_text(encoding="utf-8-sig")
+    except OSError:
+        return None
+    return MemoryStore._parse_entries(raw)
+
+
+def _memory_block_end(text: str, match: re.Match) -> int:
+    """Exclusive end of one boxed block. Prefer the on-disk entry text."""
+    start = match.end()
+    header = text[match.start():match.end()]
+    target = "user" if "USER PROFILE" in header else "memory"
+    entries = _disk_entries(target)
+    if entries:
+        from tools.memory_tool_store import ENTRY_DELIMITER
+
+        body = ENTRY_DELIMITER.join(entries)
+        if body and text.startswith(body, start):
+            return start + len(body)
+    candidates = []
+    nxt = _BLOCK_OPEN.search(text, start)
+    if nxt:
+        candidates.append(nxt.start())
+    for anchor in _POST_MEMORY_ANCHORS:
+        at = text.find("\n\n" + anchor, start)
+        if at != -1:
+            candidates.append(at)
+    if candidates:
+        return min(candidates)
+    return len(text)
+
+
+def _strip_memory_blocks(text: str, repl: str) -> tuple[str, int]:
     hidden = 0
-    chunks: list[str] = []
     out: list[str] = []
     pos = 0
     while pos < len(text):
@@ -614,13 +669,10 @@ def _strip_memory_blocks(text: str, repl: str) -> tuple[str, int, list[str]]:
             out.append(text[pos:])
             break
         out.append(text[pos:match.start()])
-        nxt = _BLOCK_OPEN.search(text, match.end())
-        end = nxt.start() if nxt else len(text)
-        chunks.extend(_memory_chunks(text[match.end():end]))
         out.append(repl)
         hidden += 1
-        pos = end
-    return "".join(out), hidden, chunks
+        pos = _memory_block_end(text, match)
+    return "".join(out), hidden
 
 
 def _store_chunks() -> list[str]:
@@ -645,87 +697,122 @@ def _store_chunks() -> list[str]:
     return chunks
 
 
-def _clean_text(text: str, repl_mem: str, repl_recall: str, chunks: list[str]) -> tuple[str, int]:
-    text, memory_hits, found = _strip_memory_blocks(text, repl_mem)
-    chunks.extend(found)
+def _scrub_owner_entries(text: str, repl: str) -> tuple[str, int]:
+    """Redact on-disk entry text that survived the block strip. Does not refuse."""
+    pieces = sorted(_store_chunks(), key=len, reverse=True)
+    hits = 0
+    for piece in pieces:
+        if piece and piece in text:
+            text = text.replace(piece, repl)
+            hits += 1
+    return text, hits
+
+
+def _clean_injected(text: str, repl_mem: str, repl_recall: str) -> tuple[str, int]:
+    text, memory_hits = _strip_memory_blocks(text, repl_mem)
     text, recall_hits = _replace(_RECALL, repl_recall, text)
-    return text, memory_hits + recall_hits
+    text, scrub_hits = _scrub_owner_entries(text, repl_mem)
+    return text, memory_hits + recall_hits + scrub_hits
 
 
-def _clean_obj(obj, repl_mem: str, repl_recall: str, chunks: list[str]):
-    """Copy *obj*, stripping memory blocks and recalls from every string."""
-    if isinstance(obj, str):
-        return _clean_text(obj, repl_mem, repl_recall, chunks)
-    if isinstance(obj, list):
+def _clean_text(text: str, injected: bool, repl_mem: str, repl_recall: str) -> tuple[str, int]:
+    if injected:
+        return _clean_injected(text, repl_mem, repl_recall)
+    # Recall tags are Hermes-injected even when they sit on a user message.
+    # The kid's own words, including a pasted header or an entry guess, stay.
+    return _replace(_RECALL, repl_recall, text)
+
+
+def _clean_parts(content, injected: bool, repl_mem: str, repl_recall: str):
+    if isinstance(content, str):
+        return _clean_text(content, injected, repl_mem, repl_recall)
+    if isinstance(content, list):
         cleaned = []
         hidden = 0
-        for item in obj:
-            new_item, count = _clean_obj(item, repl_mem, repl_recall, chunks)
+        for item in content:
+            if isinstance(item, dict) and isinstance(item.get("text"), str):
+                new_item = dict(item)
+                new_item["text"], count = _clean_text(item["text"], injected, repl_mem, repl_recall)
+                hidden += count
+                cleaned.append(new_item)
+                continue
+            new_item, count = _clean_parts(item, injected, repl_mem, repl_recall)
             hidden += count
             cleaned.append(new_item)
         return cleaned, hidden
-    if isinstance(obj, dict):
-        cleaned = {}
-        hidden = 0
-        for key, value in obj.items():
-            new_value, count = _clean_obj(value, repl_mem, repl_recall, chunks)
+    return content, 0
+
+
+def _clean_message(message, repl_mem: str, repl_recall: str):
+    if not isinstance(message, dict):
+        return message, 0
+    injected = message.get("role") in _INJECTED_ROLES
+    new = dict(message)
+    hidden = 0
+    for key in ("content", "text"):
+        if key not in message:
+            continue
+        cleaned, count = _clean_parts(message[key], injected, repl_mem, repl_recall)
+        new[key] = cleaned
+        hidden += count
+    return new, hidden
+
+
+def _clean_request(request: dict, repl_mem: str, repl_recall: str):
+    req = copy.deepcopy(request)
+    hidden = 0
+    for key in ("system", "instructions"):
+        if key not in req:
+            continue
+        cleaned, count = _clean_parts(req[key], True, repl_mem, repl_recall)
+        req[key] = cleaned
+        hidden += count
+    for key in ("messages", "input"):
+        items = req.get(key)
+        if not isinstance(items, list):
+            continue
+        cleaned_items = []
+        for item in items:
+            new_item, count = _clean_message(item, repl_mem, repl_recall)
             hidden += count
-            cleaned[key] = new_value
-        return cleaned, hidden
-    return obj, 0
+            cleaned_items.append(new_item)
+        req[key] = cleaned_items
+    return req, hidden
 
 
-def _walk_strings(obj, found: list[str]) -> None:
-    if isinstance(obj, str):
-        found.append(obj)
-    elif isinstance(obj, dict):
-        for value in obj.values():
-            _walk_strings(value, found)
-    elif isinstance(obj, list):
-        for value in obj:
-            _walk_strings(value, found)
+def _injected_strings(req) -> list[str]:
+    found: list[str] = []
 
+    def take(content):
+        if isinstance(content, str):
+            found.append(content)
+        elif isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and isinstance(item.get("text"), str):
+                    found.append(item["text"])
+                elif isinstance(item, str):
+                    found.append(item)
 
-def _memory_files_text() -> str:
-    try:
-        from tools.memory_tool import get_memory_dir
-    except Exception:
-        return ""
-    parts = []
-    root = get_memory_dir()
-    for name in ("MEMORY.md", "USER.md"):
-        path = root / name
-        if not path.is_file():
+    for key in ("system", "instructions"):
+        if key in req:
+            take(req[key])
+    for key in ("messages", "input"):
+        items = req.get(key)
+        if not isinstance(items, list):
             continue
-        try:
-            parts.append(path.read_text(encoding="utf-8-sig"))
-        except OSError:
-            continue
-    return "\n".join(parts)
+        for item in items:
+            if isinstance(item, dict) and item.get("role") in _INJECTED_ROLES:
+                take(item.get("content"))
+                take(item.get("text"))
+    return found
 
 
-def _owner_memory_remains(req, chunks: list[str]) -> bool:
-    """True when a real memory block or its entry text is still in the payload.
+def _structural_block_remains(req) -> bool:
+    """A boxed owner-memory header is still in an injected section.
 
-    A quoted header with no boxed block and no stored entry text does not count.
+    Kid and tool text is not inspected, so pasting the header cannot refuse the turn.
     """
-    texts: list[str] = []
-    _walk_strings(req, texts)
-    if any(_BLOCK_OPEN.search(text) for text in texts):
-        return True
-    blob = "\n".join(texts)
-    raw = _memory_files_text()
-    watched: list[str] = []
-    for piece in list(chunks) + _store_chunks():
-        if piece in watched:
-            continue
-        # Ignore prompt tails that were only inside the stripped span (the
-        # timestamp Hermes joins after the last block). Real entries are in
-        # the memory files. With no files, every extracted piece counts.
-        if raw and piece not in raw:
-            continue
-        watched.append(piece)
-    return any(piece in blob for piece in watched)
+    return any(_BLOCK_OPEN.search(text) for text in _injected_strings(req))
 
 
 def _tool_name(tool) -> str:
@@ -840,13 +927,12 @@ def _llm_request(**kwargs):
             return None
         repl_mem = _msg(pol, "memory_withheld")
         repl_recall = _msg(pol, "recall_withheld")
-        chunks: list[str] = []
         if tier not in pol["memory_tiers"]:
-            req, hidden = _clean_obj(request, repl_mem, repl_recall, chunks)
-            if _owner_memory_remains(req, chunks):
+            req, hidden = _clean_request(request, repl_mem, repl_recall)
+            if _structural_block_remains(req):
                 return _llm_result(
                     _refusal_request(req, DEFAULT_MESSAGES["policy_error_tool"]),
-                    f"{who} ({tier}): owner memory still present; refused",
+                    f"{who} ({tier}): owner memory block still present; refused",
                 )
         else:
             req, hidden = copy.deepcopy(request), 0

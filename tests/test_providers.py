@@ -123,7 +123,7 @@ def test_codex_instructions_and_responses_tools(ht, home, monkeypatch):
     assert out["store"] is False
 
 
-def test_leftover_memory_entry_refuses_the_request(ht, home, monkeypatch):
+def test_guessed_entry_is_not_a_refusal_but_a_leftover_system_block_is(ht, home, monkeypatch):
     from tools.memory_tool_store import MemoryStore
 
     _policy(home)
@@ -137,11 +137,31 @@ def test_leftover_memory_entry_refuses_the_request(ht, home, monkeypatch):
     }
     out = ht._llm_request(request=request, session_id="left")["request"]
     blob = json.dumps(out)
-    assert "LEFTOVER_ENTRY_TOKEN" not in blob
-    assert "policy error" in blob
-    assert "tools" not in out
-    still_boxed = {"messages": [{"role": "user", "content": "═" * 20 + "\nMEMORY (your personal notes) [1%]\n" + "═" * 20 + "\nkept"}]}
-    assert ht._owner_memory_remains(still_boxed, [])
+    assert "LEFTOVER_ENTRY_TOKEN" in blob
+    assert "policy error" not in blob
+    assert any((tool.get("function") or {}).get("name") == "web_search" for tool in out["tools"])
+    boxed = "═" * 20 + "\nMEMORY (your personal notes) [1%]\n" + "═" * 20 + "\nstill here"
+    monkeypatch.setattr(ht, "_strip_memory_blocks", lambda text, repl: (text, 0))
+    leaked = {
+        "messages": [
+            {"role": "system", "content": boxed},
+            {"role": "user", "content": "hello"},
+        ],
+        "tools": _openai_tools(),
+    }
+    refused = ht._llm_request(request=leaked, session_id="left")["request"]
+    assert "policy error" in json.dumps(refused)
+    assert "tools" not in refused
+    pasted = {
+        "messages": [
+            {"role": "system", "content": "You are Hermes."},
+            {"role": "user", "content": boxed},
+        ],
+        "tools": _openai_tools(),
+    }
+    kept = ht._llm_request(request=pasted, session_id="left")["request"]
+    assert "policy error" not in json.dumps(kept)
+    assert boxed in kept["messages"][1]["content"]
 
 
 def test_hide_tools_env_cannot_disable_memory_filtering(ht, home, monkeypatch):

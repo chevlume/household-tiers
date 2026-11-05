@@ -74,6 +74,37 @@ def test_path_compare_uses_normcase(ht, home, monkeypatch):
     assert blocked["action"] == "block"
 
 
+def test_symlink_with_missing_component_cannot_escape_into_hermes_home(ht, tmp_path, monkeypatch):
+    """Hermes realpath follows the link; a missing segment must not skip that."""
+    session = tmp_path / "proj"
+    session.mkdir()
+    hermes = tmp_path / "dot-hermes"
+    (hermes / "memories").mkdir(parents=True)
+    secret = "SYMLINK_MEMORY_SECRET"
+    (hermes / "memories" / "MEMORY.md").write_text(secret, encoding="utf-8")
+    (hermes / "household-tiers.json").write_text(
+        json.dumps({"preset": "family", "users": {"telegram:333": "user"}}),
+        encoding="utf-8",
+    )
+    (session / "h").symlink_to(hermes)
+    monkeypatch.setenv("HERMES_HOME", str(hermes))
+    monkeypatch.setenv("TERMINAL_CWD", str(session))
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "333")
+    monkeypatch.chdir(session)
+    from tools.file_tools import read_file_tool
+
+    opened = read_file_tool("h/x/../memories/MEMORY.md", task_id="symlink")
+    assert secret in opened
+    blocked = ht._pre_tool_call(
+        tool_name="read_file",
+        args={"path": "h/x/../memories/MEMORY.md"},
+        session_id="symlink",
+        task_id="symlink",
+    )
+    assert blocked["action"] == "block"
+
+
 def test_memory_tiers_must_be_a_list(ht, home, monkeypatch):
     (home / "household-tiers.json").write_text(
         json.dumps({"users": {"telegram:333": "user"}, "memory_tiers": "owner"}),

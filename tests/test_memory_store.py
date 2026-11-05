@@ -116,6 +116,135 @@ def test_multiparagraph_memory_is_removed_on_real_transports(kid, home):
             raise AssertionError(f"{mode}: {exc}") from exc
 
 
+def _visible(payload):
+    return _names(payload), "policy error" in json.dumps(payload, ensure_ascii=False, default=str)
+
+
+def test_guessing_an_owner_entry_does_not_change_the_turn(kid, home):
+    """A kid who types an exact entry must get the same outcome as any other text."""
+    from tools.memory_tool_store import MemoryStore
+
+    store = MemoryStore(memory_char_limit=8000, user_char_limit=8000)
+    entry = "wifi casa SECRETA01"
+    added = store.add("memory", entry)
+    assert added.get("success"), added
+    added = store.add("user", "Prefers concise answers")
+    assert added.get("success"), added
+    store.load_from_disk()
+    system = "\n\n".join([
+        "You are Hermes.",
+        store.format_for_system_prompt("memory"),
+        store.format_for_system_prompt("user"),
+    ])
+    tools = [
+        {"type": "function", "function": {"name": "web_search", "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {"name": "terminal", "parameters": {"type": "object", "properties": {}}}},
+    ]
+
+    def turn(user_text, prior=None):
+        messages = [{"role": "system", "content": system}]
+        if prior:
+            messages.extend(prior)
+        messages.append({"role": "user", "content": user_text})
+        return kid._llm_request(
+            request={"messages": messages, "tools": tools},
+            session_id="guess",
+        )["request"]
+
+    guessed = turn("¿es 'wifi casa SECRETA01' la clave?")
+    plain = turn("hello")
+    assert _visible(guessed) == _visible(plain)
+    assert "policy error" not in json.dumps(guessed)
+    assert entry in json.dumps(guessed["messages"][-1])
+    follow = turn("ayúdame con mates", prior=[{"role": "user", "content": "¿es 'wifi casa SECRETA01' la clave?"}])
+    assert _visible(follow) == _visible(plain)
+    page = {
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": "what does this page say?"},
+            {"role": "tool", "tool_call_id": "call_1", "content": "The guide says: Prefers concise answers."},
+        ],
+        "tools": tools,
+    }
+    looked = kid._llm_request(request=page, session_id="guess")["request"]
+    assert _visible(looked) == _visible(plain)
+    assert "Prefers concise answers" in json.dumps(looked["messages"][-1])
+    boxed = store.format_for_system_prompt("memory")
+    pasted = turn(boxed + "\n\nwhat is that?")
+    assert _visible(pasted) == _visible(plain)
+    assert "MEMORY (your personal notes)" in pasted["messages"][-1]["content"]
+
+
+def test_real_system_prompt_keeps_sections_after_memory(kid, home, monkeypatch):
+    """Hermes joins the timestamp, profile line, and runtime block after memory."""
+    from types import SimpleNamespace
+
+    from agent.system_prompt import build_system_prompt
+    from tools.memory_tool_store import MemoryStore
+
+    store = MemoryStore(memory_char_limit=8000, user_char_limit=8000)
+    added = store.add("memory", "PIN_LINE_ONE\n\nSECOND_PARAGRAPH_TOKEN")
+    assert added.get("success"), added
+    added = store.add("memory", "LATER_ENTRY_TOKEN")
+    assert added.get("success"), added
+    added = store.add("user", "PROFILE_FIRST\n\nPROFILE_SECOND_PARAGRAPH")
+    assert added.get("success"), added
+    store.load_from_disk()
+    agent = SimpleNamespace(
+        load_soul_identity=False,
+        skip_context_files=True,
+        valid_tool_names=[],
+        _task_completion_guidance=False,
+        _tool_use_enforcement=False,
+        _execution_guidance=False,
+        _environment_probe=False,
+        _kanban_worker_guidance="",
+        _memory_store=store,
+        _memory_manager=SimpleNamespace(
+            build_system_prompt=lambda: "EXTERNAL_PROVIDER_NOTE keeps this section.\n\nSECOND_PARAGRAPH_TOKEN",
+        ),
+        _memory_enabled=True,
+        _user_profile_enabled=True,
+        _bot_mode_protocol=False,
+        model="gpt-4o",
+        provider="openai",
+        platform="cli",
+        pass_session_id=False,
+        session_id="demo",
+        _emit_diagnostic_status=lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(
+        "agent.prompt_builder.build_environment_hints",
+        lambda: "HOST_HINT_TOKEN",
+    )
+    prompt = build_system_prompt(agent)
+    assert "SECOND_PARAGRAPH_TOKEN" in prompt
+    assert "Conversation started:" in prompt
+    assert "Active Hermes profile:" in prompt
+    assert "HOST_HINT_TOKEN" in prompt
+    assert "# Hermes runtime environment" in prompt
+    assert "EXTERNAL_PROVIDER_NOTE" in prompt
+    from agent.transports import get_transport
+
+    messages = [{"role": "system", "content": prompt}, {"role": "user", "content": "hello"}]
+    tools = [
+        {"type": "function", "function": {"name": "web_search", "parameters": {"type": "object", "properties": {}}}},
+        {"type": "function", "function": {"name": "terminal", "parameters": {"type": "object", "properties": {}}}},
+    ]
+    request = get_transport("chat_completions").build_kwargs("gpt-4o", messages, tools)
+    out = kid._llm_request(request=request, session_id="prompt")["request"]
+    blob = json.dumps(out, ensure_ascii=False, default=str)
+    for secret in SECRETS:
+        assert secret not in blob
+    assert "Conversation started:" in blob
+    assert "Active Hermes profile:" in blob
+    assert "HOST_HINT_TOKEN" in blob
+    assert "# Hermes runtime environment" in blob
+    assert "EXTERNAL_PROVIDER_NOTE" in blob
+    assert "policy error" not in blob
+    assert "web_search" in _names(out)
+
+
 def test_quoted_memory_header_does_not_refuse_the_turn(kid, home):
     request = {
         "messages": [

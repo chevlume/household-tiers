@@ -14,7 +14,8 @@ known_issues:
   - "Shared sessions (a thread with thread_sessions_per_user false, or a group with group_sessions_per_user false) carry replies to other people. Non-owner tiers are refused there by default (shared_threads refuse) and asked to use a direct message."
   - "If household-tiers.json is unreadable, tool calls are blocked and memory blocks are withheld from every request, including the owner's, and every gateway turn gets a short error reply until the file is fixed."
   - "HTTP redirects onto the local network, and DNS names that change address between check and connect, are not re-validated. A non-owner web tool resolves the hostname once with the system resolver and does not fetch the URL. See the README known issues."
-  - "Memory stripping and tool filtering were executed on chat_completions, anthropic_messages, codex_responses, and bedrock_converse payloads from Hermes commit ed1afb08, including multi-paragraph entries joined with §. Gemini conversion was not executed. Relative paths use Hermes _resolve_base_dir. Case-folding was tested with a monkeypatched normcase on Linux, not on macOS."
+  - "Memory stripping and tool filtering were executed on chat_completions, anthropic_messages, codex_responses, and bedrock_converse payloads from Hermes commit ed1afb08, including multi-paragraph entries joined with §. The strip stops at the memory block; the date line and runtime block stay. A kid message that quotes an entry does not refuse the turn. Gemini conversion was not executed. Relative paths use Hermes _resolve_base_dir and os.path.realpath. Case-folding was tested with a monkeypatched normcase on Linux, not on macOS."
+  - "Context compaction's auxiliary summary (agent/context_compressor.py, MEMORY PROVIDER CONTEXT) does not pass through llm_request. post_compaction is observer-only and does not receive the summary. That path was not executed."
 capabilities:
   provides_tools: []
   provides_hooks:
