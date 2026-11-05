@@ -1,0 +1,17 @@
+{
+  "preset": "family",
+  "timezone": "UTC",
+  "users": {
+    "telegram:100001": "owner",
+    "telegram:200002": "kid",
+    "telegram:300003": "user"
+  },
+  "notify": {
+    "platform": "telegram",
+    "chat_id": "900009"
+  },
+  "audit": {
+    "enabled": true,
+    "retention_days": 30
+  }
+}

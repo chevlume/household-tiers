@@ -1,0 +1,10 @@
+{
+  "memory-shield": {
+    "repo": "https://github.com/churnast/hermes-memory-shield",
+    "sha": "4deef3e29a906874031ca69620c393a93af7bddc"
+  },
+  "readonly-guard": {
+    "repo": "https://github.com/mciocchi/hermes-readonly-guard",
+    "sha": "2c2b4d98f1e3c8578bd76b811614c752e2d77d35"
+  }
+}

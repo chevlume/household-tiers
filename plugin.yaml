@@ -1,0 +1,17 @@
+name: household-tiers
+version: 0.1.0
+description: "Per-person tool tiers for one shared Hermes bot, with a family preset for curfew, a parent alert, private owner memory, and a homework note."
+author: Chevlume
+license: MIT
+homepage: https://github.com/chevlume/household-tiers
+requires_hermes: ">=0.22.7"
+provides_hooks:
+  - pre_tool_call
+  - subagent_start
+  - pre_gateway_dispatch
+  - post_gateway_admission
+provides_middleware:
+  - llm_request
+provides_commands:
+  - family
+  - familia
