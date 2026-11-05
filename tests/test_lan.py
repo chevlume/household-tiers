@@ -1,4 +1,6 @@
-"""Local-network block for non-owner tiers. No DNS and no HTTP."""
+"""Local-network block for non-owner tiers. DNS is stubbed; no HTTP."""
+
+import socket
 
 import pytest
 
@@ -6,6 +8,22 @@ POLICY = {
     "preset": "family",
     "users": {"telegram:222": "kid", "telegram:111": "owner"},
 }
+
+_DNS = {
+    "example.com": ["93.184.215.14"],
+    "router.home.test": ["192.168.1.50"],
+    "dual.example": ["1.1.1.1", "10.1.2.3"],
+}
+
+
+def _install_dns(monkeypatch):
+    def fake(host, port, *args, **kwargs):
+        ips = _DNS.get(host)
+        if ips is None:
+            raise socket.gaierror(host)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 0)) for ip in ips]
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake)
 
 
 def _block(ht, monkeypatch, uid, url):
@@ -32,11 +50,15 @@ def _block(ht, monkeypatch, uid, url):
         ("222", "http://93.184.215.14.nip.io/", False),
         ("222", "http://unparsed.nip.io/", True),
         ("222", "http://example.com/", False),
+        ("222", "http://router.home.test/", True),
+        ("222", "http://dual.example/", True),
+        ("222", "http://missing.example/", True),
     ],
 )
 def test_local_address_classification(ht, home, monkeypatch, uid, url, blocked):
     import json
 
+    _install_dns(monkeypatch)
     (home / "household-tiers.json").write_text(json.dumps(POLICY), encoding="utf-8")
     assert _block(ht, monkeypatch, uid, url) is blocked
 

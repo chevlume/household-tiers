@@ -4,4 +4,4 @@
 
 First release of household-tiers.
 
-Migration: an earlier build stored its policy and audit log as `guestlist.json` and `guestlist-audit.jsonl` under HERMES_HOME. Those names are still read when `household-tiers.json` or `household-tiers-audit.jsonl` is absent. New writes go to the household-tiers files. `/family forget` and audit retention also purge the legacy audit file.
+Migration: an earlier build stored its policy and audit log as `guestlist.json` and `guestlist-audit.jsonl` under HERMES_HOME. This plugin does not read those names. Rename them to `household-tiers.json` and `household-tiers-audit.jsonl` if you still have them.

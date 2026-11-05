@@ -108,26 +108,13 @@ def test_audit_can_be_disabled(ht, home, monkeypatch):
     assert not (home / "household-tiers-audit.jsonl").exists()
 
 
-def test_legacy_state_files_are_a_fallback(ht, home, monkeypatch):
-    legacy_policy = home / f"{ht._legacy_stem()}.json"
-    legacy_audit = home / f"{ht._legacy_stem()}-audit.jsonl"
-    legacy_policy.write_text(
-        json.dumps({"preset": "family", "users": {"telegram:111": "owner", "telegram:222": "kid"}, "audit": {"retention_days": 365}}),
-        encoding="utf-8",
-    )
-    now = time.time()
-    legacy_audit.write_text(
-        json.dumps({"t": now, "decision": "block", "who": "telegram:222", "tool": "terminal", "why": "tool_denied"}) + "\n",
-        encoding="utf-8",
-    )
-    import types
-
-    source = types.SimpleNamespace(platform=types.SimpleNamespace(value="telegram"), user_id="111")
-    summary = ht._family("", source=source)
-    assert "terminal×1" in summary
+def test_tool_names_in_the_audit_are_capped(ht, home, monkeypatch):
+    _policy(home)
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
     monkeypatch.setenv("HERMES_SESSION_USER_ID", "222")
-    assert ht._pre_tool_call(tool_name="terminal", args={}, session_id="leg")["action"] == "block"
-    ht._family("tier telegram:222 user", source=source)
-    assert (home / "household-tiers.json").exists()
-    assert json.loads((home / "household-tiers.json").read_text(encoding="utf-8"))["users"]["telegram:222"] == "user"
+    secret = "SECRET_TOOL_NAME_TEXT"
+    ht._pre_tool_call(tool_name="terminal" + secret + ("x" * 80), args={}, session_id="s")
+    blob = (home / "household-tiers-audit.jsonl").read_text(encoding="utf-8")
+    assert secret not in blob
+    record = json.loads(blob.splitlines()[-1])
+    assert "tool" not in record

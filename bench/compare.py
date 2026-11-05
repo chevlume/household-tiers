@@ -16,6 +16,7 @@ import asyncio
 import importlib.util
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -57,14 +58,25 @@ def _count(blob: str) -> int:
 
 
 def _tokens(tools: list) -> tuple[int, str]:
-    payload = [json.dumps(tool, ensure_ascii=False) for tool in tools]
     try:
         import tiktoken
-
-        encoder = tiktoken.get_encoding("cl100k_base")
-        return sum(len(encoder.encode(item)) for item in payload), "tiktoken cl100k_base (Hermes tool-token estimator)"
-    except Exception:
-        return sum(len(item) // 4 for item in payload), "chars/4 fallback (tiktoken unavailable)"
+    except ImportError:
+        sys.stderr.write(
+            "bench/compare.py requires tiktoken. Install it with pip install tiktoken "
+            "and re-run. Refusing to print a chars/4 estimate.\n"
+        )
+        raise SystemExit(2)
+    encoder = tiktoken.get_encoding("cl100k_base")
+    # sort_keys: schema key order is not stable. The text_to_speech schema also
+    # embeds this process's temp directory; normalize that so the count does
+    # not move between runs. The kid allow-list does not include that tool.
+    payload = []
+    for tool in tools:
+        blob = json.dumps(tool, ensure_ascii=False, sort_keys=True)
+        blob = re.sub(r"/tmp/[^\"\\]+/audio_cache/", "/tmp/<process-temp>/audio_cache/", blob)
+        payload.append(blob)
+    label = "tiktoken cl100k_base; json.dumps sort_keys ensure_ascii=False; text_to_speech temp dir normalized"
+    return sum(len(encoder.encode(item)) for item in payload), label
 
 
 def _tool_names(tools: list) -> list[str]:
@@ -108,7 +120,7 @@ def main() -> int:
                 {"role": "system", "content": _memory_system()},
                 {"role": "user", "content": f"hello\n<memory-context>{SENTINEL_RECALL}</memory-context>"},
             ],
-            "tools": unfiltered[:3],
+            "tools": unfiltered,
         }
         # The recall sentinel is the same string as the memory block on purpose:
         # _count only looks at the two owner markers. Count them in the two
@@ -119,6 +131,52 @@ def main() -> int:
         after_blob = json.dumps(after_req)
         restricted_leaks = _count(after_blob)
         recall_leaks = after_blob.count(SENTINEL_RECALL)
+
+        def _shape(request):
+            cleaned = plugin._llm_request(request=request, session_id="shape")["request"]
+            blob = json.dumps(cleaned, ensure_ascii=False)
+            names = []
+            for tool in cleaned.get("tools") or []:
+                names.append(tool.get("name") or (tool.get("function") or {}).get("name"))
+            return {
+                "owner_markers": _count(blob),
+                "recall_markers": blob.count(SENTINEL_RECALL),
+                "memory_header": "MEMORY (your personal notes)" in blob,
+                "visible_tools": names,
+            }
+
+        from agent.anthropic_message_convert import convert_messages_to_anthropic, convert_tools_to_anthropic
+        from agent.codex_responses_adapter import _chat_messages_to_responses_input, _responses_tools
+
+        chat_messages = secret_request["messages"]
+        openai_tools = unfiltered
+        anth_system, anth_messages = convert_messages_to_anthropic(chat_messages)
+        anth_tools = convert_tools_to_anthropic(openai_tools)
+        boxed = chat_messages[0]["content"]
+        block_messages = [
+            {"role": "system", "content": [{"type": "text", "text": boxed, "cache_control": {"type": "ephemeral"}}]},
+            chat_messages[1],
+        ]
+        block_system, block_converted = convert_messages_to_anthropic(block_messages)
+        codex_tools = _responses_tools(openai_tools)
+        shapes = {
+            "chat_completions": _shape(secret_request),
+            "anthropic_system_string": _shape({
+                "model": "claude-sonnet-4-5", "max_tokens": 256,
+                "system": anth_system, "messages": anth_messages, "tools": anth_tools,
+            }),
+            "anthropic_system_blocks": _shape({
+                "model": "claude-sonnet-4-5", "max_tokens": 256,
+                "system": block_system, "messages": block_converted,
+                "tools": convert_tools_to_anthropic(openai_tools),
+            }),
+            "codex_responses": _shape({
+                "model": "gpt-5-codex", "store": False,
+                "instructions": chat_messages[0]["content"],
+                "input": _chat_messages_to_responses_input(chat_messages[1:]),
+                "tools": codex_tools,
+            }),
+        }
 
         (home / "household-tiers.json").write_text("{ broken", encoding="utf-8")
         broken = plugin._llm_request(request=secret_request, session_id="broken")
@@ -193,7 +251,7 @@ def main() -> int:
         loaded = next(
             module
             for module_name, module in sys.modules.items()
-            if module_name.startswith("hermes_plugins.") and hasattr(module, "_legacy_stem")
+            if module_name.startswith("hermes_plugins.") and getattr(module, "PLUGIN_NAME", None) == "household-tiers"
         )
         loaded._now = lambda tz: __import__("datetime").time(15, 0)
         runner = object.__new__(GatewayRunner)
@@ -233,6 +291,7 @@ def main() -> int:
             "filtered_schema_tokens": filtered_tokens,
             "restricted_prompt_owner_markers_before": before,
             "restricted_prompt_owner_markers_after": restricted_leaks,
+            "shapes": shapes,
             "restricted_prompt_memory_context_tags_after": recall_leaks,
             "broken_config_owner_markers": broken_leaks,
             "broken_config_tools": broken_tools,

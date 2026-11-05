@@ -22,7 +22,6 @@ SESSION_ENV = (
     "HERMES_CRON_SESSION",
     "HERMES_PLUGIN_HOST_PROCESS",
     "HERMES_ALLOW_PRIVATE_URLS",
-    "HOUSEHOLD_TIERS_HIDE_TOOLS",
 )
 
 
@@ -109,7 +108,7 @@ def gateway(tmp_path, monkeypatch):
     loaded = [
         module
         for module_name, module in sys.modules.items()
-        if module_name.startswith("hermes_plugins.") and hasattr(module, "_legacy_stem")
+        if module_name.startswith("hermes_plugins.") and getattr(module, "PLUGIN_NAME", None) == "household-tiers"
     ]
     assert len(loaded) == 1, [name for name in sys.modules if name.startswith("hermes_plugins.")]
     yield {"home": hermes_home, "mod": loaded[0], "plugins": plugins}

@@ -11,17 +11,19 @@ deliver the parent alert. ``_Runtime.seen_messaging`` records that this process
 has already served a chat platform; a later call with no sender is then a
 guest, not the local owner.
 
-No network calls. State is the two files under HERMES_HOME named in the README.
+No HTTP calls and no telemetry. URL tools for a non-owner tier may resolve a hostname with the system resolver. State is the two files under HERMES_HOME named in the README.
 """
 
 from __future__ import annotations
 
 import asyncio
+import copy
 import datetime as dt
 import ipaddress
 import json
 import os
 import re
+import socket
 import threading
 import time
 from pathlib import Path
@@ -48,8 +50,8 @@ PRESETS = {
         "tiers": {"kid": list(_FAMILY_KID_TOOLS)},
         "notes": {"kid": _HOMEWORK_NOTE},
         "hours": {
-            "kid": {"tz": "Europe/Madrid", "allow": "08:00-21:00"},
-            "guest": {"tz": "Europe/Madrid", "allow": "08:00-21:00"},
+            "kid": {"allow": "08:00-21:00"},
+            "guest": {"allow": "08:00-21:00"},
         },
     }
 }
@@ -57,6 +59,7 @@ PRESETS = {
 DEFAULT_MESSAGES = {
     "tool_blocked": "household-tiers: {who} ({tier}) may not use {tool}. Ask the owner to change your tier.",
     "private_url": "household-tiers: {who} ({tier}) may not open local-network addresses.",
+    "path_blocked": "household-tiers: {who} ({tier}) may not read household files.",
     "policy_error_tool": "household-tiers: policy error; blocked.",
     "policy_error_turn": "household-tiers: the household policy has an error, so this message was not sent to the model.",
     "shared_thread": "This shared conversation is closed to your tier. Send a direct message instead.",
@@ -81,8 +84,11 @@ DEFAULT_MESSAGES = {
 }
 
 _URL_TOOLS = {"web_extract", "web_crawl", "browser_navigate"}
+_FILE_TOOLS = {"read_file", "search_files"}
 _AUDIT_FIELDS = ("decision", "who", "tier", "tool", "why", "session", "window", "target", "count")
-_WHY = {"private_url", "policy_error", "tool_denied", "shared_thread", "curfew", "tier_change", "forget"}
+_WHY = {"private_url", "private_path", "policy_error", "tool_denied", "shared_thread", "curfew", "tier_change", "forget"}
+_TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}\Z")
+_HEADER_MARKERS = ("MEMORY (your personal notes)", "USER PROFILE (who the user is)")
 _MEM_BLOCK = re.compile(
     r"═+\n(?:MEMORY \(your personal notes\)|USER PROFILE \(who the user is\))[^\n]*\n═+\n.*?(?=\n\n|\Z)",
     re.S,
@@ -111,11 +117,6 @@ class _SafeFormat(dict):
         return "{" + key + "}"
 
 
-def _legacy_stem() -> str:
-    """Previous on-disk prefix. The changelog spells the old filenames."""
-    return "guest" + "list"
-
-
 def _home() -> Path:
     return Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
 
@@ -123,12 +124,7 @@ def _home() -> Path:
 def _policy_path() -> Path | None:
     home = _home()
     current = home / "household-tiers.json"
-    if current.exists():
-        return current
-    legacy = home / f"{_legacy_stem()}.json"
-    if legacy.exists():
-        return legacy
-    return None
+    return current if current.exists() else None
 
 
 def _read_policy_file() -> dict:
@@ -169,11 +165,40 @@ def _policy() -> dict:
     if not isinstance(pol["default"], str):
         raise ValueError("default must be a string")
     pol["tiers"] = {**DEFAULT_TIERS, **preset.get("tiers", {}), **tiers}
-    pol["hours"] = {**preset.get("hours", {}), **(hours or {})}
+    pol["timezone"] = _timezone(raw.get("timezone", "UTC"))
+    pol["hours"] = _hours_with_timezone({**preset.get("hours", {}), **(hours or {})}, pol["timezone"])
     pol["notes"] = {**preset.get("notes", {}), **(notes or {})}
     pol["messages"] = {**DEFAULT_MESSAGES, **_string_map(messages)}
+    pol["memory_tiers"] = _memory_tiers(raw.get("memory_tiers", ["owner"]))
     _audit_settings(pol)
     return pol
+
+
+def _timezone(value) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("timezone must be a time zone name")
+    ZoneInfo(value.strip())
+    return value.strip()
+
+
+def _hours_with_timezone(hours: dict, timezone: str) -> dict:
+    out = {}
+    for tier, rule in hours.items():
+        if not isinstance(rule, dict) or not isinstance(rule.get("allow"), str):
+            raise ValueError("hours entries must be objects with an allow window")
+        copied = dict(rule)
+        if not copied.get("tz"):
+            copied["tz"] = timezone
+        else:
+            _timezone(copied["tz"])
+        out[tier] = copied
+    return out
+
+
+def _memory_tiers(value) -> list:
+    if not isinstance(value, list) or any(not isinstance(item, str) or not item for item in value):
+        raise ValueError("memory_tiers must be a list of tier names")
+    return list(value)
 
 
 def _string_map(value) -> dict:
@@ -206,8 +231,7 @@ def _msg(pol: dict, key: str, **fields) -> str:
 
 
 def _audit_paths() -> list[Path]:
-    home = _home()
-    return [home / "household-tiers-audit.jsonl", home / f"{_legacy_stem()}-audit.jsonl"]
+    return [_home() / "household-tiers-audit.jsonl"]
 
 
 def _write_path() -> Path:
@@ -227,6 +251,9 @@ def _audit(pol: dict | None, **rec) -> None:
         value = rec[key]
         if key == "why":
             if value not in _WHY:
+                continue
+        elif key == "tool":
+            if not isinstance(value, str) or _TOOL_NAME_RE.fullmatch(value) is None:
                 continue
         elif key == "count":
             if isinstance(value, bool) or not isinstance(value, int):
@@ -373,11 +400,27 @@ def _embedded_ips(label: str) -> list:
     return found
 
 
-def _host_is_local(host: str | None) -> bool:
-    """True when the host is a local address we can classify without a lookup.
+def _resolved_ips(host: str):
+    """Addresses from the system resolver. None when lookup fails (fail closed)."""
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return None
+    found = []
+    for info in infos:
+        try:
+            found.append(ipaddress.ip_address(str(info[4][0]).split("%", 1)[0]))
+        except (ValueError, IndexError):
+            return None
+    return found or None
 
-    Ordinary hostnames return False. This plugin does not resolve DNS and does
-    not fetch redirects. See the README known issues.
+
+def _host_is_local(host: str | None) -> bool:
+    """True for a local address, a local name, or a hostname that resolves to one.
+
+    IP literals and encoded forms are classified locally. Other names are
+    resolved once. HTTP redirects are not followed, and a later DNS change is
+    not seen. A failed lookup is treated as local.
     """
     if not host:
         return True
@@ -397,7 +440,10 @@ def _host_is_local(host: str | None) -> bool:
             if not embedded:
                 return True
             return any(_ip_is_local(item) for item in embedded)
-    return False
+    resolved = _resolved_ips(name)
+    if resolved is None:
+        return True
+    return any(_ip_is_local(item) for item in resolved)
 
 
 def _lan_opened() -> bool:
@@ -458,11 +504,50 @@ def _private_url(tool_name: str, args, tier: str, pol: dict) -> bool:
     return any(_host_is_local(_url_host(url)) for url in urls)
 
 
+def _under_hermes_home(path_str: str) -> bool:
+    home = _home().resolve()
+    try:
+        candidate = Path(os.path.expanduser(path_str or ".")).expanduser()
+        if not candidate.is_absolute():
+            candidate = Path.cwd() / candidate
+        resolved = candidate.resolve()
+    except Exception:
+        return True
+    try:
+        resolved.relative_to(home)
+        return True
+    except ValueError:
+        pass
+    # A search rooted above the household directory would walk into it.
+    try:
+        home.relative_to(resolved)
+    except ValueError:
+        return False
+    return True
+
+
+def _sensitive_file_args(args) -> bool:
+    paths: list[str] = []
+    data = args if isinstance(args, dict) else {}
+    for key in ("path", "file", "directory", "root"):
+        value = data.get(key)
+        if isinstance(value, str):
+            paths.append(value)
+        elif isinstance(value, list):
+            paths.extend(item for item in value if isinstance(item, str))
+    if not paths:
+        paths = ["."]
+    return any(_under_hermes_home(path) for path in paths)
+
+
 def _pre_tool_call(tool_name: str = "", args=None, session_id: str = "", **kwargs):
     try:
         tier, who = _identity(session_id)
         pol = _policy()
         if _allowed(tier, tool_name, pol):
+            if "*" not in pol["tiers"].get(tier, []) and tool_name in _FILE_TOOLS and _sensitive_file_args(args):
+                _audit(pol, decision="block", who=who, tier=tier, tool=tool_name, why="private_path")
+                return {"action": "block", "message": _msg(pol, "path_blocked", who=who, tier=tier, tool=tool_name)}
             if _private_url(tool_name, args, tier, pol):
                 _audit(pol, decision="block", who=who, tier=tier, tool=tool_name, why="private_url")
                 return {"action": "block", "message": _msg(pol, "private_url", who=who, tier=tier, tool=tool_name)}
@@ -487,81 +572,158 @@ def _replace(pattern: re.Pattern, repl: str, text: str) -> tuple[str, int]:
     return pattern.subn(lambda _match: repl, text)
 
 
-def _rewrite_messages(req: dict, repl_mem: str, repl_recall: str) -> tuple[list, int]:
-    hidden = 0
-    messages = []
-    for message in req.get("messages") or []:
-        content = message.get("content") if isinstance(message, dict) else None
-        role = message.get("role") if isinstance(message, dict) else None
-        if role == "system" and isinstance(content, str):
-            content, count = _replace(_MEM_BLOCK, repl_mem, content)
+def _clean_text(text: str, repl_mem: str, repl_recall: str) -> tuple[str, int]:
+    text, memory_hits = _replace(_MEM_BLOCK, repl_mem, text)
+    text, recall_hits = _replace(_RECALL, repl_recall, text)
+    return text, memory_hits + recall_hits
+
+
+def _clean_obj(obj, repl_mem: str, repl_recall: str):
+    """Copy *obj*, stripping memory blocks and recalls from every string."""
+    if isinstance(obj, str):
+        return _clean_text(obj, repl_mem, repl_recall)
+    if isinstance(obj, list):
+        cleaned = []
+        hidden = 0
+        for item in obj:
+            new_item, count = _clean_obj(item, repl_mem, repl_recall)
             hidden += count
-            message = dict(message, content=content)
-        elif role == "user" and isinstance(content, str) and "memory-context" in content:
-            content, count = _replace(_RECALL, repl_recall, content)
+            cleaned.append(new_item)
+        return cleaned, hidden
+    if isinstance(obj, dict):
+        cleaned = {}
+        hidden = 0
+        for key, value in obj.items():
+            new_value, count = _clean_obj(value, repl_mem, repl_recall)
             hidden += count
-            message = dict(message, content=content)
-        messages.append(message)
-    return messages, hidden
+            cleaned[key] = new_value
+        return cleaned, hidden
+    return obj, 0
+
+
+def _headers_remain(req) -> bool:
+    try:
+        blob = json.dumps(req, ensure_ascii=False, default=str)
+    except Exception:
+        return True
+    return any(marker in blob for marker in _HEADER_MARKERS)
+
+
+def _tool_name(tool) -> str:
+    """OpenAI nested name, or the top-level name Anthropic and Codex use."""
+    if not isinstance(tool, dict):
+        return ""
+    function = tool.get("function")
+    if isinstance(function, dict) and isinstance(function.get("name"), str) and function["name"]:
+        return function["name"]
+    name = tool.get("name")
+    return name if isinstance(name, str) else ""
+
+
+def _append_note(req: dict, text: str) -> bool:
+    if isinstance(req.get("instructions"), str):
+        req["instructions"] += text
+        return True
+    system = req.get("system")
+    if isinstance(system, str):
+        req["system"] = system + text
+        return True
+    if isinstance(system, list):
+        for block in system:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                block["text"] += text
+                return True
+    messages = req.get("messages")
+    if isinstance(messages, list):
+        for index, message in enumerate(messages):
+            if not isinstance(message, dict) or message.get("role") != "system":
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                messages[index] = dict(message, content=content + text)
+                return True
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and isinstance(block.get("text"), str):
+                        block["text"] += text
+                        return True
+    return False
+
+
+def _refusal_request(req: dict, refusal: str) -> dict:
+    """A same-family payload whose text is only the refusal and which has no tools."""
+    out = {key: req[key] for key in ("model", "max_tokens", "max_output_tokens", "temperature", "store") if key in req}
+    if "instructions" in req or "input" in req:
+        out["instructions"] = refusal
+        out["input"] = [{"type": "message", "role": "user", "content": refusal}]
+        out.setdefault("store", False)
+        return out
+    if "system" in req:
+        out["system"] = refusal
+        out["messages"] = [{"role": "user", "content": refusal}]
+        return out
+    out["messages"] = [{"role": "user", "content": refusal}]
+    return out
+
+
+def _llm_result(req: dict, reason: str) -> dict:
+    return {"request": req, "source": PLUGIN_NAME, "reason": reason}
 
 
 def _llm_request(**kwargs):
     request = kwargs.get("request")
     if not isinstance(request, dict):
         return None
-    req = dict(request)
     try:
         tier, who = _identity(kwargs.get("session_id") or "")
         pol = _policy()
         if "*" in pol["tiers"].get(tier, []):
             return None
-        hidden = 0
-        if tier not in pol.get("memory_tiers", ["owner"]):
-            messages, hidden = _rewrite_messages(
-                req, _msg(pol, "memory_withheld"), _msg(pol, "recall_withheld")
-            )
-            req["messages"] = messages
+        repl_mem = _msg(pol, "memory_withheld")
+        repl_recall = _msg(pol, "recall_withheld")
+        if tier not in pol["memory_tiers"]:
+            req, hidden = _clean_obj(request, repl_mem, repl_recall)
+            if _headers_remain(req):
+                return _llm_result(
+                    _refusal_request(req, DEFAULT_MESSAGES["policy_error_tool"]),
+                    f"{who} ({tier}): owner memory still present; refused",
+                )
+        else:
+            req, hidden = copy.deepcopy(request), 0
         note = (pol.get("notes") or {}).get(tier)
         noted = False
-        messages = req.get("messages") or []
-        if (
-            isinstance(note, str)
-            and note
-            and messages
-            and isinstance(messages[0], dict)
-            and messages[0].get("role") == "system"
-            and isinstance(messages[0].get("content"), str)
-        ):
-            prefix = _msg(pol, "tier_note_prefix", tier=tier)
-            req["messages"] = [dict(messages[0], content=messages[0]["content"] + "\n\n" + prefix + note)] + list(messages[1:])
-            noted = True
-        if not req.get("tools"):
-            if hidden or noted:
-                return {
-                    "request": req,
-                    "source": PLUGIN_NAME,
-                    "reason": f"{who} ({tier}): {hidden} memory blocks withheld" + (", note added" if noted else ""),
-                }
-            return None
-        keep = [tool for tool in req["tools"] if _allowed(tier, (tool.get("function") or {}).get("name", ""), pol)]
-        req["tools"] = keep
-        return {
-            "request": req,
-            "source": PLUGIN_NAME,
-            "reason": f"{who} ({tier}): {len(keep)} tools visible, {hidden} memory blocks withheld",
-        }
+        if isinstance(note, str) and note:
+            noted = _append_note(req, "\n\n" + _msg(pol, "tier_note_prefix", tier=tier) + note)
+        tools = req.get("tools")
+        if isinstance(tools, list):
+            kept = [tool for tool in tools if _allowed(tier, _tool_name(tool), pol)]
+            if kept:
+                req["tools"] = kept
+            else:
+                req.pop("tools", None)
+                req.pop("tool_choice", None)
+            visible = len(kept)
+        else:
+            visible = None
+        if hidden or noted or isinstance(tools, list):
+            reason = f"{who} ({tier}): {hidden} memory blocks withheld"
+            if visible is not None:
+                reason += f", {visible} tools visible"
+            if noted:
+                reason += ", note added"
+            return _llm_result(req, reason)
+        return None
     except Exception:
         try:
-            req = dict(request)
-            messages, _hidden = _rewrite_messages(
-                req, DEFAULT_MESSAGES["withheld_error"], DEFAULT_MESSAGES["withheld_error"]
+            return _llm_result(
+                _refusal_request(dict(request), DEFAULT_MESSAGES["policy_error_tool"]),
+                "error: failed closed",
             )
-            req["messages"] = messages
-            req.pop("tools", None)
-            req.pop("tool_choice", None)
-            return {"request": req, "source": PLUGIN_NAME, "reason": "error: failed closed"}
         except Exception:
-            return None
+            return _llm_result(
+                {"messages": [{"role": "user", "content": DEFAULT_MESSAGES["policy_error_tool"]}]},
+                "error: failed closed",
+            )
 
 
 def _now(tz: str) -> dt.time:
@@ -654,13 +816,14 @@ def _post_admission_inner(session_key: str, platform: str, source) -> dict | Non
     tier = pol["users"].get(who, pol["default"])
     ids = _participant_ids(platform, src)
     shared = pol.get("shared_threads", "refuse") == "refuse"
-    memory_tiers = pol.get("memory_tiers", ["owner"])
+    memory_tiers = pol["memory_tiers"]
+    # No sender id is not a free pass: a shared session we cannot attribute
+    # is refused for tiers that do not keep owner memory.
     if (
         tier not in memory_tiers
         and src.get("chat_type", "dm") != "dm"
-        and ids
-        and not any(str(session_key).endswith(":" + item) for item in ids)
         and shared
+        and (not ids or not any(str(session_key).endswith(":" + item) for item in ids))
     ):
         _audit(pol, decision="shared_thread", who=who, tier=tier, why="shared_thread")
         return {"action": "handled", "reply": _msg(pol, "shared_thread", who=who, tier=tier)}
@@ -832,5 +995,4 @@ def register(ctx):
     ctx.register_hook("post_gateway_admission", _post_admission)
     ctx.register_hook("pre_tool_call", _pre_tool_call)
     ctx.register_hook("subagent_start", _subagent_start)
-    if os.environ.get("HOUSEHOLD_TIERS_HIDE_TOOLS", "1") == "1":
-        ctx.register_middleware("llm_request", _llm_request)
+    ctx.register_middleware("llm_request", _llm_request)

@@ -6,9 +6,13 @@ The gateway enforces this with `post_gateway_admission`, `pre_gateway_dispatch`,
 
 This release was executed against Hermes commit `ed1afb082eb3e46cf2edae9d8f68fb67b09ee4df`. That commit reports base version **0.22.7** (193 commits after the `v0.22.7` tag). `requires_hermes` is `>=0.22.7` because catalog rule 14 requires a SemVer floor no newer than the current release, and a floor above `0.22.7` would not load on this commit. The `v0.22.7` tag itself was not re-tested.
 
+Tested Python: CPython **3.14.10** locally, and GitHub Actions `ubuntu-latest` with uv's CPython 3.14. Not tested on 3.11, 3.12, or 3.13.
+
 ## Install
 
-Python 3.14 and Hermes at the commit above. Copy this repository into the plugins directory and enable it:
+`hermes plugins install household-tiers` is not available yet. The catalog entry in `catalog/household-tiers.yaml` is a draft in this private repository and has not been merged into the Hermes catalog, so a catalog name does not resolve.
+
+Until that listing exists, clone the git repository into the plugins directory and enable it:
 
 ```bash
 mkdir -p ~/.hermes/plugins
@@ -23,7 +27,7 @@ plugins:
     - household-tiers
 ```
 
-Restart the gateway. The plugin is standard-library Python only. It declares no Python dependencies.
+Restart the gateway. The plugin is standard-library Python only. It declares no Python dependencies. `bench/compare.py` is separate and needs `tiktoken` (`pip install tiktoken`). It exits if tiktoken is missing.
 
 ## Quick start
 
@@ -47,12 +51,13 @@ An id that is not in `users` is `guest`: no tools, no owner memory, and the same
 
 | Field | Meaning |
 | --- | --- |
-| `preset` | `family` adds the `kid` tier, the homework note, and hours `08:00–21:00` Europe/Madrid for `kid` and `guest`. |
+| `preset` | `family` adds the `kid` tier, the homework note, and hours `08:00–21:00` for `kid` and `guest`. The clock is `timezone`, below. |
+| `timezone` | IANA name for tiers whose `hours` entry does not set `tz`. Default `UTC`. Example: `"timezone": "Europe/Madrid"`. |
 | `users` | Map of `platform:id` to a tier name. |
-| `tiers` | Tool names, or `["*"]`. Overrides the preset. `todo` and `todo_list` are both listed for `kid` and `user` because the Hermes tool is `todo_list`. |
-| `hours` | Per tier: `{"tz", "allow": "HH:MM-HH:MM", "reply"?, "reply_in_groups"?}`. A window that crosses midnight is allowed. `reply` replaces the default quiet-hours text for that tier. |
+| `tiers` | Tool names, or `["*"]`. Overrides the preset. `todo` and `todo_list` are both listed for `kid` and `user` because the Hermes tool is `todo_list`. `user` also has `read_file` and `search_files`, but not for paths under `HERMES_HOME`. |
+| `hours` | Per tier: `{"allow": "HH:MM-HH:MM", "tz"?, "reply"?, "reply_in_groups"?}`. A window that crosses midnight is allowed. `tz` overrides `timezone`. `reply` replaces the default quiet-hours text for that tier. |
 | `notes` | Text appended to the system prompt for that tier. The same string every turn. |
-| `memory_tiers` | Tiers that still receive owner memory. Default `["owner"]`. |
+| `memory_tiers` | List of tier names that still receive owner memory. Default `["owner"]`. A string is a broken policy and fails closed. `user` is not in the default, so that tier does not get owner memory in the prompt and cannot read the household directory. |
 | `shared_threads` | Default `refuse`. Non-owner tiers are refused in a shared group or thread session. |
 | `cron_tier` | Tier for cron sessions. Default `owner`. |
 | `default` | Tier for an unmapped sender. Default `guest`. |
@@ -83,39 +88,42 @@ Set the platform `allow_admin_from` (and `group_allow_admin_from` in groups) to 
 
 ## Measured results
 
-Hermes commit `ed1afb08`, toolset `hermes-telegram`, tokenizer **tiktoken `cl100k_base`** (the estimator Hermes uses for tool schemas). The Hermes-4-70B tokenizer is not in that tree and was not used. No model was called.
+Hermes commit `ed1afb08`, toolset `hermes-telegram`. Tokenizer: **tiktoken `cl100k_base`**. Each schema is `json.dumps(..., sort_keys=True, ensure_ascii=False)`. The `text_to_speech` default path embeds the process temp directory; that directory is replaced with `/tmp/<process-temp>/` before counting so the total does not move between runs. Two runs of `python bench/compare.py` both printed **9301** unfiltered and **477** filtered. No model was called. `bench/compare.py` exits with status 2 if tiktoken is not installed.
 
 | Figure | Measured | Command |
 | --- | --- | --- |
 | Visible tools, unfiltered vs kid | **20** vs **2** (`web_extract`, `web_search`) | `python bench/compare.py` |
-| Tool-schema tokens, unfiltered vs kid | **9,350** vs **476** | `python bench/compare.py` |
-| Owner memory + profile markers in a kid prompt | **0 / 2** (2 / 2 before the middleware) | `python bench/compare.py` |
-| Recalled `<memory-context>` marker after middleware | **0** | `python bench/compare.py` |
-| Owner markers with a broken policy; tools left on the request | **0**; tools removed | `python bench/compare.py` |
+| Tool-schema tokens, unfiltered vs kid | **9301** vs **477** | `python bench/compare.py` |
+| Owner markers, chat completions | **0** (2 before) | `python bench/compare.py` (`shapes.chat_completions`) |
+| Owner markers, Anthropic `system` string | **0**; visible tools `web_extract`, `web_search` | `python bench/compare.py` (`shapes.anthropic_system_string`) |
+| Owner markers, Anthropic `system` blocks with `cache_control` | **0**; same two tools | `python bench/compare.py` (`shapes.anthropic_system_blocks`) |
+| Owner markers, Codex `instructions` + `input` | **0**; same two tools | `python bench/compare.py` (`shapes.codex_responses`) |
+| Owner markers with a broken policy | **0**; tools removed | `python bench/compare.py` |
 | Host isolation (`HERMES_PLUGIN_HOST_PROCESS=1`) | tier `guest`, **0** owner markers | `python bench/compare.py` |
 | Prepared `/btw` request (no live model) | **0** owner markers | `python bench/compare.py` |
 | Prepared `/bg` child session | **0** owner markers; `terminal` blocked; `memory` blocked | `python bench/compare.py` |
 | Background memory review | `memory` blocked for the kid session; live review **not run** | `python bench/compare.py` |
 | Shared group, message text copied into the reply | **0**; turn handled | `python bench/compare.py` |
 | LAN block for the kid (`allow_private_urls` on) | blocked `192.168.1.1`, `127.0.0.1`, decimal `2130706433`, `192.168.1.1.nip.io`; allowed `93.184.215.14` | `python bench/compare.py` |
-| `pre_tool_call` p95, 200 allow-path calls | **2.9e-05 s** (0.029 ms; the test bound is 2 ms) | `python bench/compare.py` and `pytest tests/test_overhead.py` |
+| `pre_tool_call` p95, 200 allow-path calls | **3.6e-05 s** on the two runs above (the test bound is 2 ms) | `python bench/compare.py` and `pytest tests/test_overhead.py` |
 | memory-shield alone vs with this plugin | **2 / 2** owner markers vs **0 / 2** | `python bench/coexistence.py` |
 | readonly-guard `/readonly writable` then a write | write allowed alone; with this plugin the kid's `terminal` call stays blocked | `python bench/coexistence.py` |
 
-`bench/coexistence.py` is optional. It clones two pins (see `bench/pins.json`) and is not part of CI. `todo_list` is on the kid allow-list but was not in the 20 schemas `hermes-telegram` produced here, so the visible set was two tools.
-
-The earlier draft's 11,579 → 1,771 token pair was not reproduced. This run's schema totals are 9,350 and 476.
+`bench/coexistence.py` is optional and is not part of CI. It clones memory-shield `4deef3e29a906874031ca69620c393a93af7bddc` and readonly-guard `2c2b4d98f1e3c8578bd76b811614c752e2d77d35` (see `bench/pins.json`). `todo_list` is on the kid allow-list but was not in the 20 schemas `hermes-telegram` produced here, so the visible set was two tools.
 
 Stderr from `bench/compare.py` may say Nous Portal auth is missing. That comes from Hermes resolving auxiliary clients while it builds tool schemas. The JSON on stdout is the measurement. No prompt was sent to a model.
 
 ## Disclosure
 
-- The plugin makes no network calls of its own. It does not resolve DNS and it does not fetch URLs.
+- The plugin does not send HTTP requests, telemetry, or self-updates, and it does not hold API keys. When a non-owner tier calls `web_extract`, `web_crawl`, or `browser_navigate` and private URLs are enabled, it resolves the hostname with the system resolver (`socket.getaddrinfo`) and blocks the call if any address is private, loopback, or link-local. It does not fetch the URL.
+- It reads `config.yaml` through Hermes (`hermes_cli.config.read_raw_config`) to see `security.allow_private_urls` and the legacy `browser.allow_private_urls` flag. `HERMES_ALLOW_PRIVATE_URLS` overrides that.
 - It writes two files under `HERMES_HOME`: `household-tiers.json` and `household-tiers-audit.jsonl`.
 - The parent alert is the gateway's `adapter.send` to the chat in `notify`. The plugin only asks for that send.
-- Each non-owner LLM request is modified: tools outside the tier are removed, owner memory blocks and `<memory-context>` recalls are replaced, and the tier note is appended to the system prompt.
+- For every non-owner tier it rewrites the whole LLM request: every string in the payload (chat `messages`, Anthropic `system` as a string or as content blocks, Codex `instructions` and `input`), then the tool list. Owner memory blocks and `<memory-context>` recalls are replaced. If a memory header is still present after that, the request is replaced with the standard refusal and the tools are removed. A tier note is appended. Tools the tier may use are kept, including `web_search` on Anthropic and Codex shapes.
+- Tiers without `*` that may call `read_file` or `search_files` cannot use those tools on a path under `HERMES_HOME` (memory, sessions, the audit log, the policy file).
 - Tool calls outside the tier are blocked in `pre_tool_call`, including subagents and a background child that inherited the sender.
-- Outside the tier's hours the gateway turn is answered by the plugin and is not passed to the model.
+- Outside the tier's hours the gateway turn is answered by the plugin and is not passed to the model. The clock is the `timezone` key, default `UTC`, unless that tier's `hours` entry sets `tz`.
+- `bench/coexistence.py` clones two third-party git repositories. That script is optional and is not required to run the plugin. It is not in CI.
 - No telemetry, no API keys, no self-update.
 - This is **not** a certified parental-control system. It does not replace the platform's own age limits.
 - Homework mode is a fixed instruction on the `kid` system prompt. Whether a given model follows it was not measured.
@@ -124,9 +132,9 @@ Stderr from `bench/compare.py` may say Nous Portal auth is missing. That comes f
 
 The owner is responsible for telling household members that this plugin is running, what it stores, and how to ask for a deletion.
 
-The audit log stores decision codes, the `platform:id`, the tier, the tool name, a short reason code, the session id, the curfew window, and a count. It does not store message text, tool arguments, or prompt contents. `audit.enabled` defaults to true. `audit.retention_days` defaults to 30. Expired lines are removed when the plugin registers and whenever `/family` runs. `/family forget <platform:id>` deletes lines whose `who` or `target` is that id. The deletion receipt records the owner and the count, not the deleted id.
+The audit log stores decision codes, the `platform:id`, the tier, a tool name matching `[A-Za-z0-9_.-]{1,64}`, a short reason code, the session id, the curfew window, and a count. It does not store message text, tool arguments, or prompt contents. `audit.enabled` defaults to true. `audit.retention_days` defaults to 30. Expired lines are removed when the plugin registers and whenever `/family` runs. `/family forget <platform:id>` deletes lines whose `who` or `target` is that id. The deletion receipt records the owner and the count, not the deleted id.
 
-Older files from the previous filename are read if the new files are missing, and retention and forget apply to them too. The names are in the changelog.
+Files left by the previous filename are not read. The changelog has those names and how to rename them.
 
 ## Known issues
 
@@ -134,7 +142,7 @@ Older files from the previous filename are read if the new files are missing, an
 - Shared sessions (a thread with `thread_sessions_per_user: false`, or a group with `group_sessions_per_user: false`) are refused for tiers that do not keep owner memory. Direct messages still work. Turn on per-user session keys for those chats.
 - Curfew runs after gateway admission. Senders the core never admits get nothing from this plugin.
 - A broken `household-tiers.json` blocks tools, strips memory for every tier including the owner, and answers each gateway turn with an error until the file is fixed.
-- HTTP redirects onto the local network are not followed. A public URL that redirects to a LAN address is not blocked here. DNS names are not resolved, so a hostname that points at the LAN is not blocked either, except `localhost`, names ending in `.local` or `.localhost`, IP literals (including decimal, hex, and octal forms), and the embedded-address forms of `nip.io`, `sslip.io`, `xip.io`, and `localtest.me`. A name that is public at one lookup and private at the next is not re-checked. When `allow_private_urls` is off, Hermes core still applies its own checks on its HTTP clients. The extra block in this plugin runs when private URLs are enabled, and only for addresses it can classify without a lookup.
+- HTTP redirects onto the local network are not followed. A public URL that 30x-redirects to a LAN address is not blocked here. Hostnames are resolved once at `pre_tool_call`. A name that is public at that lookup and private when the connection opens is not re-checked. IP literals (including decimal, hex, and octal), `localhost`, names ending in `.local` or `.localhost`, and the embedded-address forms of `nip.io`, `sslip.io`, `xip.io`, and `localtest.me` are classified as well. A failed lookup is treated as local. When `allow_private_urls` is off, Hermes core still applies its own checks and this plugin does not add a second block.
 - A WhatsApp session key that ends with an id other than `user_id` or `user_id_alt` does not match. The non-owner tier is refused.
 - Homework-mode compliance is not measured.
 - `hermes plugins validate` warns on Hermes imports inside `bench/`. Those files are not loaded with the plugin. The plugin module itself is not in that warning. Validation still exits 0. Doctor `--ci` reports no errors.

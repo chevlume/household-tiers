@@ -1,5 +1,6 @@
 {
   "preset": "family",
+  "timezone": "UTC",
   "users": {
     "telegram:100001": "owner",
     "telegram:200002": "kid",
