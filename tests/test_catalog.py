@@ -19,6 +19,18 @@ def _validator():
     return namespace["validate_entry"]
 
 
+def test_catalog_and_plugin_descriptions_match():
+    sentence = (
+        "built-in owner memory (MEMORY.md/USER.md) withheld from non-owner prompts; "
+        "external memory providers and compaction summaries are not filtered"
+    )
+    catalog = yaml.safe_load(ENTRY.read_text(encoding="utf-8"))
+    plugin = yaml.safe_load((ROOT / "plugin.yaml").read_text(encoding="utf-8"))
+    pasted = (ROOT / "CATALOG_DESCRIPTION.txt").read_text(encoding="utf-8").strip()
+    assert catalog["description"] == plugin["description"] == pasted
+    assert sentence in pasted
+
+
 def test_standalone_validator_accepts_the_entry():
     data = yaml.safe_load(ENTRY.read_text(encoding="utf-8"))
     errors, _warnings = _validator()(data)

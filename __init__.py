@@ -34,7 +34,10 @@ PLUGIN_NAME = "household-tiers"
 
 DEFAULT_TIERS = {
     "owner": ["*"],
-    "user": ["web_search", "web_extract", "read_file", "search_files", "todo", "todo_list"],
+    # No file tools. A custom policy may add them; non-owner file access is
+    # then limited to file_roots (default empty) and never to credential or
+    # browser-profile directories.
+    "user": ["web_search", "web_extract", "todo", "todo_list"],
     "guest": [],
 }
 
@@ -59,7 +62,7 @@ PRESETS = {
 DEFAULT_MESSAGES = {
     "tool_blocked": "household-tiers: {who} ({tier}) may not use {tool}. Ask the owner to change your tier.",
     "private_url": "household-tiers: {who} ({tier}) may not open local-network addresses.",
-    "path_blocked": "household-tiers: {who} ({tier}) may not read household files.",
+    "path_blocked": "household-tiers: {who} ({tier}) may not read that path.",
     "policy_error_tool": "household-tiers: policy error; blocked.",
     "policy_error_turn": "household-tiers: the household policy has an error, so this message was not sent to the model.",
     "shared_thread": "This shared conversation is closed to your tier. Send a direct message instead.",
@@ -85,6 +88,36 @@ DEFAULT_MESSAGES = {
 
 _URL_TOOLS = {"web_extract", "web_crawl", "browser_navigate"}
 _FILE_TOOLS = {"read_file", "search_files"}
+# Always blocked for a non-owner file tool, even inside file_roots.
+# Joined onto Path.home() and the OS account home.
+_SECRET_DIR_PARTS = (
+    (".ssh",),
+    (".aws",),
+    (".gnupg",),
+    (".kube",),
+    (".docker",),
+    (".azure",),
+    (".config", "gh"),
+    (".config", "gcloud"),
+    (".mozilla",),
+    (".config", "google-chrome"),
+    (".config", "chromium"),
+    (".config", "microsoft-edge"),
+    (".config", "BraveSoftware"),
+    (".config", "opera"),
+    (".config", "vivaldi"),
+    ("Library", "Application Support", "Google", "Chrome"),
+    ("Library", "Application Support", "Chromium"),
+    ("Library", "Application Support", "Microsoft Edge"),
+    ("Library", "Application Support", "BraveSoftware"),
+    ("Library", "Application Support", "Firefox"),
+    ("Library", "Safari"),
+    ("AppData", "Local", "Google", "Chrome"),
+    ("AppData", "Local", "Chromium"),
+    ("AppData", "Local", "Microsoft", "Edge"),
+    ("AppData", "Local", "BraveSoftware"),
+    ("AppData", "Roaming", "Mozilla"),
+)
 _AUDIT_FIELDS = ("decision", "who", "tier", "tool", "why", "session", "window", "target", "count")
 _WHY = {"private_url", "private_path", "policy_error", "tool_denied", "shared_thread", "curfew", "tier_change", "forget"}
 _TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}\Z")
@@ -121,6 +154,7 @@ class _Runtime:
         self.by_session: dict = {}
         self.seen_messaging = False
         self.runner = None
+        self.ctx = None
 
 
 _runtime = _Runtime()
@@ -132,7 +166,10 @@ class _SafeFormat(dict):
 
 
 def _home() -> Path:
-    return Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
+    """Active profile home. Same resolver ``get_memory_dir()`` uses."""
+    from hermes_constants import get_hermes_home
+
+    return Path(get_hermes_home())
 
 
 def _policy_path() -> Path | None:
@@ -184,6 +221,10 @@ def _policy() -> dict:
     pol["notes"] = {**preset.get("notes", {}), **(notes or {})}
     pol["messages"] = {**DEFAULT_MESSAGES, **_string_map(messages)}
     pol["memory_tiers"] = _memory_tiers(raw.get("memory_tiers", ["owner"]))
+    roots = raw.get("file_roots", [])
+    if roots is None:
+        roots = []
+    pol["file_roots"] = _file_roots(roots)
     _audit_settings(pol)
     return pol
 
@@ -213,6 +254,21 @@ def _memory_tiers(value) -> list:
     if not isinstance(value, list) or any(not isinstance(item, str) or not item for item in value):
         raise ValueError("memory_tiers must be a list of tier names")
     return list(value)
+
+
+def _file_roots(value) -> list[str]:
+    """Absolute roots a non-owner file tool may use. Empty allows nothing."""
+    if not isinstance(value, list):
+        raise ValueError("file_roots must be a list of path strings")
+    roots: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("file_roots must be a list of path strings")
+        expanded = Path(os.path.expanduser(item.strip()))
+        if not expanded.is_absolute():
+            raise ValueError("file_roots entries must be absolute after ~ expansion")
+        roots.append(str(expanded))
+    return roots
 
 
 def _string_map(value) -> dict:
@@ -518,14 +574,24 @@ def _private_url(tool_name: str, args, tier: str, pol: dict) -> bool:
     return any(_host_is_local(_url_host(url)) for url in urls)
 
 
-def _session_base(task_id: str) -> Path:
-    """Same base Hermes file tools use: session dir, then TERMINAL_CWD, then cwd."""
-    try:
-        from tools.file_tools_paths import _resolve_base_dir
+def _session_base() -> Path:
+    """Session directory for a relative file path.
 
-        return Path(_resolve_base_dir(task_id or ""))
-    except Exception:
-        return Path.cwd()
+    ``ctx.session_cwd()`` is the calling session's workspace, not the gateway
+    process cwd. No registered context, or an empty or relative answer, fails
+    closed (the relative path is refused).
+    """
+    ctx = _runtime.ctx
+    reader = getattr(ctx, "session_cwd", None) if ctx is not None else None
+    if not callable(reader):
+        raise RuntimeError("session cwd is unavailable")
+    text = str(reader() or "").strip()
+    if not text:
+        raise RuntimeError("session cwd is empty")
+    path = Path(os.path.expanduser(text))
+    if not path.is_absolute():
+        raise RuntimeError("session cwd is not absolute")
+    return path
 
 
 def _host_realpath(path: Path) -> str:
@@ -540,25 +606,39 @@ def _same_or_under(child: str, parent: str) -> bool:
     return child.startswith(prefix)
 
 
-def _under_hermes_home(path_str: str, task_id: str = "") -> bool:
-    try:
-        home = _host_realpath(_home())
-    except Exception:
-        return True
-    try:
-        candidate = Path(os.path.expanduser(str(path_str or "."))).expanduser()
-        if not candidate.is_absolute():
-            candidate = _session_base(task_id) / candidate
-        resolved = _host_realpath(candidate)
-    except Exception:
-        return True
-    if _same_or_under(resolved, home):
-        return True
-    # A search rooted above the household directory would walk into it.
-    return _same_or_under(home, resolved)
+def _touches(path: str, blocked: str) -> bool:
+    """True when ``path`` is inside ``blocked`` or a walk of ``path`` would enter it."""
+    return _same_or_under(path, blocked) or _same_or_under(blocked, path)
 
 
-def _sensitive_file_args(args, task_id: str = "") -> bool:
+def _account_homes() -> list[Path]:
+    homes = [Path.home()]
+    try:
+        import pwd
+
+        homes.append(Path(pwd.getpwuid(os.getuid()).pw_dir))
+    except Exception:
+        pass
+    return homes
+
+
+def _secret_dirs() -> list[str]:
+    found: list[str] = []
+    for home in _account_homes():
+        for parts in _SECRET_DIR_PARTS:
+            found.append(_host_realpath(home.joinpath(*parts)))
+    return found
+
+
+def _resolve_user_path(path_str: str) -> str:
+    text = str(path_str if path_str is not None else "").strip() or "."
+    candidate = Path(os.path.expanduser(text))
+    if not candidate.is_absolute():
+        candidate = _session_base() / candidate
+    return _host_realpath(candidate)
+
+
+def _path_args(args) -> list[str]:
     paths: list[str] = []
     data = args if isinstance(args, dict) else {}
     for key in ("path", "file", "file_path", "directory", "root", "target"):
@@ -567,9 +647,27 @@ def _sensitive_file_args(args, task_id: str = "") -> bool:
             paths.append(value)
         elif isinstance(value, list):
             paths.extend(item for item in value if isinstance(item, str))
-    if not paths:
-        paths = ["."]
-    return any(_under_hermes_home(path, task_id) for path in paths)
+    return paths or ["."]
+
+
+def _file_path_denied(args, pol: dict) -> bool:
+    """Non-owner file tools: allow only file_roots, never secrets or the profile home.
+
+    Any resolution failure is a denial. An empty ``file_roots`` denies every path.
+    """
+    try:
+        roots = [_host_realpath(Path(item)) for item in pol.get("file_roots") or []]
+        blocked = [_host_realpath(_home())]
+        blocked.extend(_secret_dirs())
+        for raw in _path_args(args):
+            resolved = _resolve_user_path(raw)
+            if not any(_same_or_under(resolved, root) for root in roots):
+                return True
+            if any(_touches(resolved, item) for item in blocked):
+                return True
+        return False
+    except Exception:
+        return True
 
 
 def _pre_tool_call(tool_name: str = "", args=None, session_id: str = "", **kwargs):
@@ -577,7 +675,9 @@ def _pre_tool_call(tool_name: str = "", args=None, session_id: str = "", **kwarg
         tier, who = _identity(session_id)
         pol = _policy()
         if _allowed(tier, tool_name, pol):
-            if "*" not in pol["tiers"].get(tier, []) and tool_name in _FILE_TOOLS and _sensitive_file_args(args, str(kwargs.get("task_id") or "")):
+            # The owner tier is not limited by file_roots. Every other tier is,
+            # including one whose tool list is ["*"].
+            if tier != "owner" and tool_name in _FILE_TOOLS and _file_path_denied(args, pol):
                 _audit(pol, decision="block", who=who, tier=tier, tool=tool_name, why="private_path")
                 return {"action": "block", "message": _msg(pol, "path_blocked", who=who, tier=tier, tool=tool_name)}
             if _private_url(tool_name, args, tier, pol):
@@ -605,9 +705,15 @@ def _replace(pattern: re.Pattern, repl: str, text: str) -> tuple[str, int]:
 
 
 def _memory_chunks(body: str) -> list[str]:
-    """Distinctive pieces of a memory block: § entries and their paragraphs."""
+    """Distinctive pieces of a memory block: delimiter entries and their paragraphs."""
+    try:
+        from tools.memory_tool_store import ENTRY_DELIMITER
+
+        parts = body.split(ENTRY_DELIMITER)
+    except Exception:
+        parts = [body]
     found: list[str] = []
-    for entry in body.split("\n§\n"):
+    for entry in parts:
         entry = entry.strip()
         pieces = [entry] if entry else []
         pieces.extend(part.strip() for part in re.split(r"\n\s*\n", entry) if part.strip())
@@ -617,21 +723,29 @@ def _memory_chunks(body: str) -> list[str]:
     return found
 
 
+def _split_memory_entries(raw: str) -> list[str]:
+    """Non-empty entries split on the full delimiter. A bare section sign stays put.
+
+    This does not call ``MemoryStore._parse_entries``. A core change to that
+    helper cannot drop entry text from the path and memory checks here.
+    """
+    from tools.memory_tool_store import ENTRY_DELIMITER
+
+    return [entry for entry in (part.strip() for part in str(raw).split(ENTRY_DELIMITER)) if entry]
+
+
 def _disk_entries(target: str) -> list[str] | None:
     try:
         from tools.memory_tool import get_memory_dir
-        from tools.memory_tool_store import MemoryStore
+
+        name = "USER.md" if target == "user" else "MEMORY.md"
+        path = get_memory_dir() / name
+        if not path.is_file():
+            return None
+        raw = path.read_text(encoding="utf-8-sig")
+        return _split_memory_entries(raw)
     except Exception:
         return None
-    name = "USER.md" if target == "user" else "MEMORY.md"
-    path = get_memory_dir() / name
-    if not path.is_file():
-        return None
-    try:
-        raw = path.read_text(encoding="utf-8-sig")
-    except OSError:
-        return None
-    return MemoryStore._parse_entries(raw)
 
 
 def _memory_block_end(text: str, match: re.Match) -> int:
@@ -679,7 +793,6 @@ def _store_chunks() -> list[str]:
     """Entry text currently in the owner's memory files, when those files exist."""
     try:
         from tools.memory_tool import get_memory_dir
-        from tools.memory_tool_store import MemoryStore
     except Exception:
         return []
     chunks: list[str] = []
@@ -690,9 +803,10 @@ def _store_chunks() -> list[str]:
             continue
         try:
             raw = path.read_text(encoding="utf-8-sig")
-        except OSError:
+            entries = _split_memory_entries(raw)
+        except Exception:
             continue
-        for entry in MemoryStore._parse_entries(raw):
+        for entry in entries:
             chunks.extend(_memory_chunks(entry))
     return chunks
 
@@ -1210,6 +1324,7 @@ def _family(raw_args: str = "", source=None, **kwargs):
 
 
 def register(ctx):
+    _runtime.ctx = ctx
     try:
         _purge(_policy())
     except Exception:
