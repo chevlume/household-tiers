@@ -8,7 +8,7 @@ This release was executed on two Hermes refs, both with CPython **3.14.10**:
 
 | Ref | Commit | What ran |
 | --- | --- | --- |
-| tag `v0.22.7` | `b200f5bc60e31588ba2cb60e288029c4a54ba5fa` | `pytest` (**105 passed**), `hermes plugins validate . --install-deps`, `hermes plugins doctor . --ci` |
+| tag `v0.22.7` | `b200f5bc60e31588ba2cb60e288029c4a54ba5fa` | `pytest` (**108 passed**), `hermes plugins validate . --install-deps`, `hermes plugins doctor . --ci` |
 | CI pin | `ed1afb082eb3e46cf2edae9d8f68fb67b09ee4df` (193 commits after that tag) | the same three commands, plus `python bench/compare.py` |
 
 `requires_hermes` stays `>=0.22.7`. Not tested on Python 3.11, 3.12, or 3.13. GitHub Actions uses `ubuntu-latest` with uv's CPython 3.14 and the CI pin only.
