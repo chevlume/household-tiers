@@ -200,7 +200,7 @@ python bench/demo.py
 
 That command reads [`demo-config.json`](demo-config.json), stores one memory entry with Hermes `MemoryStore.add`, builds the system prompt with `agent.system_prompt.build_system_prompt`, and calls `_llm_request`, `_pre_tool_call`, `_post_admission`, and `_family`. No model is called.
 
-This copy was generated against Hermes `{commit}`. `requires_hermes` is `>=0.22.7` because that commit reports base version 0.22.7. The `v0.22.7` tag itself was not re-run. Python was CPython {py}. Install is `git clone` into `~/.hermes/plugins/household-tiers`. `hermes plugins install household-tiers` does not resolve while this repository is private and the catalog draft is unpublished.
+This copy was generated against Hermes `{commit}`. The test suite was also run on tag `v0.22.7` (`b200f5bc60e31588ba2cb60e288029c4a54ba5fa`). `requires_hermes` is `>=0.22.7`. Python was CPython {py}. Install is `git clone` into `~/.hermes/plugins/household-tiers`. `hermes plugins install household-tiers` does not resolve while the catalog draft is unpublished. The git repository is public.
 
 The policy is `telegram:100001` owner, `telegram:200002` kid, `telegram:300003` user, timezone UTC, quiet hours `08:00–21:00` for kid and guest.
 

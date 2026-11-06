@@ -11,7 +11,7 @@ deliver the parent alert. ``_Runtime.seen_messaging`` records that this process
 has already served a chat platform; a later call with no sender is then a
 guest, not the local owner.
 
-No HTTP calls and no telemetry. URL tools for a non-owner tier may resolve a hostname with the system resolver. State is the two files under HERMES_HOME named in the README.
+No HTTP calls and no telemetry. URL tools for a non-owner tier may resolve a hostname with the system resolver. State is the two files under HERMES_HOME named in the README. A parsed policy and unchanged memory files are reused; secret-directory paths are reused until a parent directory of those paths changes.
 """
 
 from __future__ import annotations
@@ -144,6 +144,17 @@ _RECALL = re.compile(r"<\s*memory-context\s*>[\s\S]*?</\s*memory-context\s*>", r
 _EMBEDDED_IP = re.compile(r"(?:\d{1,3}[.-]){3}\d{1,3}")
 # Wildcard DNS names that encode an address in the hostname. Classified locally.
 _WILDCARD_DNS_SUFFIXES = (".nip.io", ".sslip.io", ".xip.io", ".localtest.me")
+# search_files walks the root for symlinks. Past this many directory entries the
+# walk stops and the call is refused, so a huge tree cannot stall the hook.
+_SYMLINK_WALK_LIMIT = 20000
+# Compaction handoff text. Locked to Hermes by tests; the auxiliary summary
+# request itself never reaches this plugin.
+_SUMMARY_PREFIXES = ("[CONTEXT COMPACTION", "[CONTEXT SUMMARY]")
+_SUMMARY_MERGE = "[END OF PRIOR CONTEXT — COMPACTION SUMMARY BELOW]"
+_PROVIDER_TAG = re.compile(
+    r"<\s*memory-provider-context\s*>[\s\S]*?</\s*memory-provider-context\s*>",
+    re.I,
+)
 
 
 class _Runtime:
@@ -155,6 +166,11 @@ class _Runtime:
         self.seen_messaging = False
         self.runner = None
         self.ctx = None
+        self.policy_key = None
+        self.policy = None
+        self.memory_files: dict = {}
+        self.blocked_key = None
+        self.blocked = None
 
 
 _runtime = _Runtime()
@@ -188,8 +204,16 @@ def _read_policy_file() -> dict:
     return data
 
 
-def _policy() -> dict:
-    raw = _read_policy_file()
+def _policy_key(path: Path):
+    """Identity of the policy file. ``None`` as the stat means the file is absent."""
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return (str(path), None)
+    return (str(path), st.st_mtime_ns, st.st_size, st.st_ino)
+
+
+def _policy_from_raw(raw: dict) -> dict:
     users = raw.get("users", {})
     if not isinstance(users, dict):
         raise ValueError("users must be an object")
@@ -226,6 +250,32 @@ def _policy() -> dict:
         roots = []
     pol["file_roots"] = _file_roots(roots)
     _audit_settings(pol)
+    return pol
+
+
+def _policy() -> dict:
+    """Parsed policy. Reused while the file's inode, mtime, and size are unchanged."""
+    path = _home() / "household-tiers.json"
+    key = _policy_key(path)
+    with _runtime.lock:
+        if _runtime.policy_key == key and _runtime.policy is not None:
+            return _runtime.policy
+    if key[1] is None:
+        raw: dict = {}
+    else:
+        text = path.read_text(encoding="utf-8")
+        # A writer may have replaced the file between stat and read.
+        key_after = _policy_key(path)
+        if key_after != key:
+            key = key_after
+            text = path.read_text(encoding="utf-8") if key[1] is not None else ""
+        raw = json.loads(text) if key[1] is not None else {}
+        if not isinstance(raw, dict):
+            raise ValueError("policy root must be a JSON object")
+    pol = _policy_from_raw(raw)
+    with _runtime.lock:
+        _runtime.policy_key = key
+        _runtime.policy = pol
     return pol
 
 
@@ -419,7 +469,12 @@ def _identity(session_id: str = "") -> tuple[str, str]:
 
 
 def _allowed(tier: str, tool: str, pol: dict | None = None) -> bool:
-    allowed = (pol or _policy())["tiers"].get(tier, [])
+    pol = pol or _policy()
+    # The memory tool reads and writes the shared MEMORY.md / USER.md. A tier
+    # that does not keep that memory does not get the tool, even from ["*"].
+    if tool == "memory" and tier not in pol["memory_tiers"]:
+        return False
+    allowed = pol["tiers"].get(tier, [])
     return "*" in allowed or tool in allowed
 
 
@@ -564,7 +619,8 @@ def _url_host(url: str) -> str | None:
 
 
 def _private_url(tool_name: str, args, tier: str, pol: dict) -> bool:
-    if tool_name not in _URL_TOOLS or "*" in pol["tiers"].get(tier, []):
+    # Owner is the only tier that skips this check. A custom ["*"] list does not.
+    if tool_name not in _URL_TOOLS or tier == "owner":
         return False
     if not _lan_opened():
         return False
@@ -630,6 +686,98 @@ def _secret_dirs() -> list[str]:
     return found
 
 
+def _blocked_paths() -> list[str]:
+    """Profile home plus credential and browser paths.
+
+    Recomputed when a parent of those paths changes (a directory's mtime moves
+    when an entry is added or replaced). The user path itself is resolved on
+    every call.
+    """
+    homes = _account_homes()
+    hermes_home = _home()
+    parents = [hermes_home]
+    for home in homes:
+        parents.extend((
+            home,
+            home / ".config",
+            home / "Library",
+            home / "Library" / "Application Support",
+            home / "AppData",
+            home / "AppData" / "Local",
+            home / "AppData" / "Roaming",
+        ))
+    stamps = []
+    for parent in parents:
+        try:
+            # Follow a symlink: a symlinked home must invalidate when the
+            # target directory gains or replaces an entry.
+            st = os.stat(parent)
+            stamps.append((str(parent), st.st_mtime_ns, st.st_ino))
+        except OSError:
+            stamps.append((str(parent), None, None))
+    key = tuple(stamps)
+    cached = _runtime.blocked
+    if cached is not None and _runtime.blocked_key == key:
+        return cached
+    blocked = [_host_realpath(hermes_home)]
+    blocked.extend(_secret_dirs())
+    found: list[str] = []
+    for item in blocked:
+        if item not in found:
+            found.append(item)
+    _runtime.blocked_key = key
+    _runtime.blocked = found
+    return found
+
+
+def _tree_has_escaping_symlink(root: str, roots: list[str], blocked: list[str]) -> bool:
+    """True when a directory entry is a symlink whose target leaves ``roots`` or touches ``blocked``.
+
+    The walk does not follow symlinks to list them. A symlink whose target is a
+    directory inside ``roots`` is scanned too. Past ``_SYMLINK_WALK_LIMIT``
+    entries, or on any filesystem error, the call is refused.
+    """
+    seen = 0
+    stack = [root]
+    visited: set[str] = set()
+    while stack:
+        current = stack.pop()
+        if current in visited:
+            continue
+        visited.add(current)
+        try:
+            iterator = os.scandir(current)
+        except OSError:
+            return True
+        with iterator:
+            for entry in iterator:
+                seen += 1
+                if seen > _SYMLINK_WALK_LIMIT:
+                    return True
+                try:
+                    is_link = entry.is_symlink()
+                except OSError:
+                    return True
+                if is_link:
+                    try:
+                        target = _host_realpath(Path(entry.path))
+                    except OSError:
+                        return True
+                    if any(_touches(target, item) for item in blocked):
+                        return True
+                    if not any(_same_or_under(target, item) for item in roots):
+                        return True
+                    if os.path.isdir(target) and target not in visited:
+                        stack.append(target)
+                    continue
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(entry.path)
+                except OSError:
+                    return True
+    return False
+
+
 def _resolve_user_path(path_str: str) -> str:
     text = str(path_str if path_str is not None else "").strip() or "."
     candidate = Path(os.path.expanduser(text))
@@ -650,21 +798,25 @@ def _path_args(args) -> list[str]:
     return paths or ["."]
 
 
-def _file_path_denied(args, pol: dict) -> bool:
+def _file_path_denied(args, pol: dict, tool_name: str = "") -> bool:
     """Non-owner file tools: allow only file_roots, never secrets or the profile home.
 
     Any resolution failure is a denial. An empty ``file_roots`` denies every path.
+    ``search_files`` also refuses a directory that contains a symlink out of the
+    roots or into a blocked path.
     """
     try:
         roots = [_host_realpath(Path(item)) for item in pol.get("file_roots") or []]
-        blocked = [_host_realpath(_home())]
-        blocked.extend(_secret_dirs())
+        blocked = _blocked_paths()
         for raw in _path_args(args):
             resolved = _resolve_user_path(raw)
             if not any(_same_or_under(resolved, root) for root in roots):
                 return True
             if any(_touches(resolved, item) for item in blocked):
                 return True
+            if tool_name == "search_files" and os.path.isdir(resolved):
+                if _tree_has_escaping_symlink(resolved, roots, blocked):
+                    return True
         return False
     except Exception:
         return True
@@ -677,7 +829,7 @@ def _pre_tool_call(tool_name: str = "", args=None, session_id: str = "", **kwarg
         if _allowed(tier, tool_name, pol):
             # The owner tier is not limited by file_roots. Every other tier is,
             # including one whose tool list is ["*"].
-            if tier != "owner" and tool_name in _FILE_TOOLS and _file_path_denied(args, pol):
+            if tier != "owner" and tool_name in _FILE_TOOLS and _file_path_denied(args, pol, tool_name):
                 _audit(pol, decision="block", who=who, tier=tier, tool=tool_name, why="private_path")
                 return {"action": "block", "message": _msg(pol, "path_blocked", who=who, tier=tier, tool=tool_name)}
             if _private_url(tool_name, args, tier, pol):
@@ -734,7 +886,8 @@ def _split_memory_entries(raw: str) -> list[str]:
     return [entry for entry in (part.strip() for part in str(raw).split(ENTRY_DELIMITER)) if entry]
 
 
-def _disk_entries(target: str) -> list[str] | None:
+def _memory_file(target: str) -> tuple[list[str], list[str]] | None:
+    """Entries and scrub chunks for one memory file. Reused while the file is unchanged."""
     try:
         from tools.memory_tool import get_memory_dir
 
@@ -742,35 +895,64 @@ def _disk_entries(target: str) -> list[str] | None:
         path = get_memory_dir() / name
         if not path.is_file():
             return None
+        st = path.stat()
+        key = (str(path), st.st_mtime_ns, st.st_size, st.st_ino)
+        cached = _runtime.memory_files.get(str(path))
+        if cached is not None and cached[0] == key:
+            return cached[1], cached[2]
         raw = path.read_text(encoding="utf-8-sig")
-        return _split_memory_entries(raw)
+        entries = _split_memory_entries(raw)
+        chunks: list[str] = []
+        for entry in entries:
+            chunks.extend(_memory_chunks(entry))
+        _runtime.memory_files[str(path)] = (key, entries, chunks)
+        return entries, chunks
     except Exception:
         return None
 
 
+def _disk_entries(target: str) -> list[str] | None:
+    loaded = _memory_file(target)
+    if loaded is None:
+        return None
+    return loaded[0]
+
+
 def _memory_block_end(text: str, match: re.Match) -> int:
-    """Exclusive end of one boxed block. Prefer the on-disk entry text."""
+    """Exclusive end of one boxed block, including a following provider block.
+
+    When the on-disk entry text matches, that body is the end of the built-in
+    block. Hermes then joins ``system_prompt_block()`` before the next section
+    anchor (plugin sections, profile, timestamp, runtime). That gap is removed
+    with the box. A later boxed header is not consumed. An anchor inside the
+    matched entry text does not cut the entry short.
+    """
     start = match.end()
     header = text[match.start():match.end()]
     target = "user" if "USER PROFILE" in header else "memory"
     entries = _disk_entries(target)
+    content_end = None
     if entries:
         from tools.memory_tool_store import ENTRY_DELIMITER
 
         body = ENTRY_DELIMITER.join(entries)
         if body and text.startswith(body, start):
-            return start + len(body)
+            content_end = start + len(body)
+    search_from = content_end if content_end is not None else start
     candidates = []
-    nxt = _BLOCK_OPEN.search(text, start)
+    nxt = _BLOCK_OPEN.search(text, search_from)
     if nxt:
         candidates.append(nxt.start())
     for anchor in _POST_MEMORY_ANCHORS:
-        at = text.find("\n\n" + anchor, start)
+        at = text.find("\n\n" + anchor, search_from)
         if at != -1:
             candidates.append(at)
-    if candidates:
-        return min(candidates)
-    return len(text)
+    boundary = min(candidates) if candidates else len(text)
+    if content_end is None:
+        return boundary
+    if boundary > content_end:
+        return boundary
+    return content_end
 
 
 def _strip_memory_blocks(text: str, repl: str) -> tuple[str, int]:
@@ -791,23 +973,12 @@ def _strip_memory_blocks(text: str, repl: str) -> tuple[str, int]:
 
 def _store_chunks() -> list[str]:
     """Entry text currently in the owner's memory files, when those files exist."""
-    try:
-        from tools.memory_tool import get_memory_dir
-    except Exception:
-        return []
     chunks: list[str] = []
-    root = get_memory_dir()
-    for name in ("MEMORY.md", "USER.md"):
-        path = root / name
-        if not path.is_file():
+    for target in ("memory", "user"):
+        loaded = _memory_file(target)
+        if loaded is None:
             continue
-        try:
-            raw = path.read_text(encoding="utf-8-sig")
-            entries = _split_memory_entries(raw)
-        except Exception:
-            continue
-        for entry in entries:
-            chunks.extend(_memory_chunks(entry))
+        chunks.extend(loaded[1])
     return chunks
 
 
@@ -825,8 +996,33 @@ def _scrub_owner_entries(text: str, repl: str) -> tuple[str, int]:
 def _clean_injected(text: str, repl_mem: str, repl_recall: str) -> tuple[str, int]:
     text, memory_hits = _strip_memory_blocks(text, repl_mem)
     text, recall_hits = _replace(_RECALL, repl_recall, text)
+    text, provider_hits = _replace(_PROVIDER_TAG, repl_mem, text)
     text, scrub_hits = _scrub_owner_entries(text, repl_mem)
-    return text, memory_hits + recall_hits + scrub_hits
+    return text, memory_hits + recall_hits + provider_hits + scrub_hits
+
+
+def _summary_span(text: str) -> tuple[int, int] | None:
+    """Byte span of a compaction handoff inside one message, if the markers match."""
+    stripped = text.lstrip()
+    offset = len(text) - len(stripped)
+    if stripped.startswith(_SUMMARY_PREFIXES):
+        return offset, len(text)
+    at = text.find(_SUMMARY_MERGE)
+    if at == -1:
+        return None
+    return at, len(text)
+
+
+def _scrub_summary_portion(text: str, repl_mem: str) -> tuple[str, int]:
+    """Redact owner entries inside a compaction handoff. Leave the rest of the message."""
+    span = _summary_span(text)
+    if span is None:
+        return text, 0
+    start, end = span
+    chunk = text[start:end]
+    chunk, provider_hits = _replace(_PROVIDER_TAG, repl_mem, chunk)
+    chunk, scrub_hits = _scrub_owner_entries(chunk, repl_mem)
+    return text[:start] + chunk + text[end:], provider_hits + scrub_hits
 
 
 def _clean_text(text: str, injected: bool, repl_mem: str, repl_recall: str) -> tuple[str, int]:
@@ -834,7 +1030,10 @@ def _clean_text(text: str, injected: bool, repl_mem: str, repl_recall: str) -> t
         return _clean_injected(text, repl_mem, repl_recall)
     # Recall tags are Hermes-injected even when they sit on a user message.
     # The kid's own words, including a pasted header or an entry guess, stay.
-    return _replace(_RECALL, repl_recall, text)
+    # A compaction handoff is not the kid's words: entry text in that span goes.
+    text, recall_hits = _replace(_RECALL, repl_recall, text)
+    text, summary_hits = _scrub_summary_portion(text, repl_mem)
+    return text, recall_hits + summary_hits
 
 
 def _clean_parts(content, injected: bool, repl_mem: str, repl_recall: str):
@@ -1037,7 +1236,9 @@ def _llm_request(**kwargs):
     try:
         tier, who = _identity(kwargs.get("session_id") or "")
         pol = _policy()
-        if "*" in pol["tiers"].get(tier, []):
+        # Owner (and any other memory tier) with every tool has nothing to change.
+        # A custom ["*"] list on a tier that does not keep memory still strips.
+        if "*" in pol["tiers"].get(tier, []) and tier in pol["memory_tiers"]:
             return None
         repl_mem = _msg(pol, "memory_withheld")
         repl_recall = _msg(pol, "recall_withheld")
@@ -1229,6 +1430,9 @@ def _save_raw(raw: dict) -> None:
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(raw, ensure_ascii=False, indent=1), encoding="utf-8")
     os.replace(tmp, path)
+    # Same-timestamp replace still has to be visible on the next command.
+    _runtime.policy_key = None
+    _runtime.policy = None
 
 
 def _digest_text(pol: dict, days: float) -> str:

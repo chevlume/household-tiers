@@ -7,7 +7,8 @@ the working directory:
     python bench/compare.py
 
 Prints one JSON object. Figures in the README are copied from that object.
-No model calls and no network calls.
+No model calls. The LAN samples in this script are IP literals and embedded
+nip.io names, classified without a resolver call. It does not fetch URLs.
 """
 
 from __future__ import annotations

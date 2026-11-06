@@ -240,7 +240,8 @@ def test_real_system_prompt_keeps_sections_after_memory(kid, home, monkeypatch):
     assert "Active Hermes profile:" in blob
     assert "HOST_HINT_TOKEN" in blob
     assert "# Hermes runtime environment" in blob
-    assert "EXTERNAL_PROVIDER_NOTE" in blob
+    # The provider block is joined after the built-in boxes. It goes with them.
+    assert "EXTERNAL_PROVIDER_NOTE" not in blob
     assert "policy error" not in blob
     assert "web_search" in _names(out)
 

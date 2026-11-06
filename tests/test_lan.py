@@ -63,6 +63,23 @@ def test_local_address_classification(ht, home, monkeypatch, uid, url, blocked):
     assert _block(ht, monkeypatch, uid, url) is blocked
 
 
+def test_star_tier_is_still_blocked_from_local_urls(ht, home, monkeypatch):
+    import json
+
+    _install_dns(monkeypatch)
+    (home / "household-tiers.json").write_text(
+        json.dumps({
+            "preset": "family",
+            "users": {"telegram:333": "user", "telegram:111": "owner"},
+            "tiers": {"user": ["*"]},
+        }),
+        encoding="utf-8",
+    )
+    assert _block(ht, monkeypatch, "333", "http://127.0.0.1/") is True
+    assert _block(ht, monkeypatch, "333", "http://93.184.215.14/") is False
+    assert _block(ht, monkeypatch, "111", "http://127.0.0.1/") is False
+
+
 def test_lan_block_is_skipped_when_private_urls_stay_closed(ht, home, monkeypatch):
     import json
 

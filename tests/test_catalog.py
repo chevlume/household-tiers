@@ -22,7 +22,8 @@ def _validator():
 def test_catalog_and_plugin_descriptions_match():
     sentence = (
         "built-in owner memory (MEMORY.md/USER.md) withheld from non-owner prompts; "
-        "external memory providers and compaction summaries are not filtered"
+        "an external provider block joined after those boxes is removed; "
+        "a provider block with no built-in box, and compaction's auxiliary summary, are not filtered"
     )
     catalog = yaml.safe_load(ENTRY.read_text(encoding="utf-8"))
     plugin = yaml.safe_load((ROOT / "plugin.yaml").read_text(encoding="utf-8"))
@@ -48,7 +49,7 @@ def test_runtime_loader_accepts_the_entry():
     assert entry.maintainer == "chevlume"
     assert entry.category == "platform"
     assert entry.requires_hermes == ">=0.22.7"
-    assert entry.version == "0.1.0"
+    assert entry.version == "0.1.1"
     assert len(entry.sha) == 40
     assert entry.capabilities.provides_middleware == ["llm_request"]
     assert "post_gateway_admission" in entry.capabilities.provides_hooks
