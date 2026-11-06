@@ -258,6 +258,48 @@ def test_account_home_credentials_are_blocked_when_home_differs(ht, home, tmp_pa
     assert blocked["action"] == "block"
 
 
+def test_search_refuses_a_symlink_inside_an_allowed_directory(ht, home, tmp_path, monkeypatch):
+    """search_files walks the root. read_file of a real file in that root still works."""
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    (shared / "ok.txt").write_text("ok", encoding="utf-8")
+    (shared / "alias.txt").symlink_to(shared / "ok.txt")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "note.txt").write_text("nope", encoding="utf-8")
+    ssh = tmp_path / ".ssh"
+    ssh.mkdir()
+    (ssh / "id_rsa").write_text("SECRETKEY", encoding="utf-8")
+    _user(home, tiers={"user": ["read_file", "search_files"]}, file_roots=[str(shared)])
+    _as_user(monkeypatch)
+    assert ht._pre_tool_call(tool_name="read_file", args={"path": str(shared / "ok.txt")}, session_id="u") is None
+    assert ht._pre_tool_call(tool_name="search_files", args={"path": str(shared)}, session_id="u") is None
+    (shared / "escape").symlink_to(outside)
+    outside_link = ht._pre_tool_call(tool_name="search_files", args={"path": str(shared)}, session_id="u")
+    assert outside_link["action"] == "block"
+    (shared / "escape").unlink()
+    (shared / "keys").symlink_to(ssh)
+    secret_link = ht._pre_tool_call(tool_name="search_files", args={"path": str(shared)}, session_id="u")
+    assert secret_link["action"] == "block"
+    # The symlink is a problem for the directory walk, not for reading a sibling file.
+    assert ht._pre_tool_call(tool_name="read_file", args={"path": str(shared / "ok.txt")}, session_id="u") is None
+    linked = ht._pre_tool_call(tool_name="read_file", args={"path": str(shared / "keys" / "id_rsa")}, session_id="u")
+    assert linked["action"] == "block"
+
+
+def test_search_walk_stops_and_refuses_past_the_entry_limit(ht, home, tmp_path, monkeypatch):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    (shared / "a.txt").write_text("a", encoding="utf-8")
+    (shared / "b.txt").write_text("b", encoding="utf-8")
+    _user(home, tiers={"user": ["search_files"]}, file_roots=[str(shared)])
+    _as_user(monkeypatch)
+    monkeypatch.setattr(ht, "_SYMLINK_WALK_LIMIT", 1)
+    blocked = ht._pre_tool_call(tool_name="search_files", args={"path": str(shared)}, session_id="u")
+    assert blocked["action"] == "block"
+    assert "may not read that path" in blocked["message"]
+
+
 def test_non_owner_star_is_still_limited_to_file_roots(ht, home, tmp_path, monkeypatch):
     shared = tmp_path / "shared"
     shared.mkdir()
