@@ -2,7 +2,7 @@ name: household-tiers
 repo: https://github.com/chevlume/household-tiers
 # Pin of the plugin tree this entry describes. A later commit that only
 # updates this line is not included; set sha to the commit you submit.
-sha: "7a36260fdd44b16cfd946f3ddc1e211ae0a703b3"
+sha: "b74c460ce86b9597d64ae1c226e9402698b32a57"
 description: "Per-person tool tiers for one shared Hermes bot, with a family preset for curfew, a parent alert, and a homework note: built-in owner memory (MEMORY.md/USER.md) withheld from non-owner prompts; an external provider block joined after those boxes is removed; a provider block with no built-in box, and compaction's auxiliary summary, are not filtered."
 maintainer: chevlume
 category: platform
