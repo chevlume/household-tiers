@@ -786,16 +786,43 @@ def _resolve_user_path(path_str: str) -> str:
     return _host_realpath(candidate)
 
 
-def _path_args(args) -> list[str]:
+# search_files "target" is the mode (content/files, aliases grep/find), not a path.
+_PATH_KEYS = ("path", "file", "file_path", "directory", "root", "target")
+_SEARCH_PATH_KEYS = ("path", "file", "file_path", "directory", "root")
+
+
+def _path_args(args, tool_name: str = "") -> list[str]:
     paths: list[str] = []
     data = args if isinstance(args, dict) else {}
-    for key in ("path", "file", "file_path", "directory", "root", "target"):
+    keys = _SEARCH_PATH_KEYS if tool_name == "search_files" else _PATH_KEYS
+    for key in keys:
         value = data.get(key)
         if isinstance(value, str):
             paths.append(value)
         elif isinstance(value, list):
             paths.extend(item for item in value if isinstance(item, str))
+    # Hermes search_files uses "." when path is omitted, null, or blank.
+    if tool_name == "search_files" and not any(item.strip() for item in paths):
+        return ["."]
     return paths or ["."]
+
+
+def _search_path_parts(raw: str) -> list[str]:
+    """Raw search path plus every part Hermes may search when that path is missing.
+
+    A comma splits the string and keeps spaces inside each part. With no comma,
+    whitespace that yields two or more pieces is split too. The raw string is
+    always included. Fail closed: one bad part refuses the call.
+    """
+    text = "" if raw is None else str(raw)
+    parts = [text]
+    if "," in text:
+        parts.extend(part.strip() for part in text.split(",") if part.strip())
+    else:
+        pieces = text.split()
+        if len(pieces) >= 2:
+            parts.extend(pieces)
+    return parts
 
 
 def _file_path_denied(args, pol: dict, tool_name: str = "") -> bool:
@@ -803,12 +830,19 @@ def _file_path_denied(args, pol: dict, tool_name: str = "") -> bool:
 
     Any resolution failure is a denial. An empty ``file_roots`` denies every path.
     ``search_files`` also refuses a directory that contains a symlink out of the
-    roots or into a blocked path.
+    roots or into a blocked path, and refuses a multi-path string unless every
+    part Hermes would search is allowed.
     """
     try:
         roots = [_host_realpath(Path(item)) for item in pol.get("file_roots") or []]
         blocked = _blocked_paths()
-        for raw in _path_args(args):
+        raws = _path_args(args, tool_name)
+        if tool_name == "search_files":
+            expanded: list[str] = []
+            for raw in raws:
+                expanded.extend(_search_path_parts(raw))
+            raws = expanded
+        for raw in raws:
             resolved = _resolve_user_path(raw)
             if not any(_same_or_under(resolved, root) for root in roots):
                 return True

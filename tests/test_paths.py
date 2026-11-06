@@ -287,6 +287,103 @@ def test_search_refuses_a_symlink_inside_an_allowed_directory(ht, home, tmp_path
     assert linked["action"] == "block"
 
 
+def _bind_session(ht, cwd):
+    class Ctx:
+        def session_cwd(self):
+            return str(cwd)
+
+        def register_command(self, *args, **kwargs):
+            pass
+
+        def register_hook(self, *args, **kwargs):
+            pass
+
+        def register_middleware(self, *args, **kwargs):
+            pass
+
+    ht.register(Ctx())
+
+
+def _hermes_search(path, pattern, **extra):
+    """What Hermes search_files returns for this path. Independent of the plugin."""
+    from tools.file_tools import search_tool
+
+    found = search_tool(pattern=pattern, path=path, task_id=extra.pop("task_id", pattern), **extra)
+    return found if isinstance(found, str) else str(found)
+
+
+def test_search_comma_path_cannot_read_memory(ht, home, tmp_path, monkeypatch):
+    """Hermes splits a missing comma-path and searches each existing part."""
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    (shared / "ok.txt").write_text("ok", encoding="utf-8")
+    memory = home / "memories" / "MEMORY.md"
+    memory.parent.mkdir(parents=True)
+    memory.write_text("OWNER_MEMORY_LEAK_TOKEN", encoding="utf-8")
+    _user(home, tiers={"user": ["search_files"]}, file_roots=[str(shared)])
+    _as_user(monkeypatch)
+    raw = f"{shared / 'missing'},{memory}"
+    blocked = ht._pre_tool_call(
+        tool_name="search_files",
+        args={"path": raw, "pattern": "OWNER_MEMORY_LEAK_TOKEN"},
+        session_id="u",
+    )
+    assert blocked["action"] == "block"
+    assert "OWNER_MEMORY_LEAK_TOKEN" in _hermes_search(raw, "OWNER_MEMORY_LEAK_TOKEN", target="content")
+    assert ht._pre_tool_call(tool_name="search_files", args={"path": str(shared / "ok.txt"), "pattern": "ok"}, session_id="u") is None
+
+
+def test_search_space_separated_path_cannot_leave_the_root(ht, home, tmp_path, monkeypatch):
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    (shared / "ok.txt").write_text("ok", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "hidden.txt"
+    secret.write_text("SECRET_OUTSIDE_ROOT", encoding="utf-8")
+    _user(home, tiers={"user": ["search_files"]}, file_roots=[str(shared)])
+    _as_user(monkeypatch)
+    raw = f"{shared / 'missing'} {secret}"
+    blocked = ht._pre_tool_call(
+        tool_name="search_files",
+        args={"path": raw, "pattern": "SECRET_OUTSIDE_ROOT"},
+        session_id="u",
+    )
+    assert blocked["action"] == "block"
+    assert "SECRET_OUTSIDE_ROOT" in _hermes_search(raw, "SECRET_OUTSIDE_ROOT")
+
+
+def test_search_target_is_a_mode_and_a_missing_path_is_the_cwd(ht, home, tmp_path, monkeypatch):
+    """target=content must not be treated as a directory named content."""
+    proj = tmp_path / "proj"
+    content = proj / "content"
+    content.mkdir(parents=True)
+    (content / "note.txt").write_text("INSIDE_CONTENT", encoding="utf-8")
+    (proj / "secret.txt").write_text("SECRET_IN_PROJ_ROOT", encoding="utf-8")
+    _user(home, tiers={"user": ["search_files"]}, file_roots=[str(content)])
+    _as_user(monkeypatch)
+    _bind_session(ht, proj)
+    for mode in ("content", "files", "grep", "find"):
+        blocked = ht._pre_tool_call(
+            tool_name="search_files",
+            args={"pattern": "SECRET_IN_PROJ_ROOT", "target": mode},
+            session_id="u",
+        )
+        assert blocked["action"] == "block", mode
+    blank = ht._pre_tool_call(
+        tool_name="search_files",
+        args={"path": "  ", "pattern": "SECRET_IN_PROJ_ROOT", "target": "content"},
+        session_id="u",
+    )
+    assert blank["action"] == "block"
+    # The mode may be sent alongside a path that really is inside the root.
+    assert ht._pre_tool_call(
+        tool_name="search_files",
+        args={"path": str(content / "note.txt"), "pattern": "INSIDE", "target": "content"},
+        session_id="u",
+    ) is None
+
+
 def test_search_walk_stops_and_refuses_past_the_entry_limit(ht, home, tmp_path, monkeypatch):
     shared = tmp_path / "shared"
     shared.mkdir()
