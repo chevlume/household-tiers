@@ -195,7 +195,7 @@ Files left by the previous filename are not read. The changelog has those names 
 - Any piece of 8 or more characters from the owner's `MEMORY.md` or `USER.md` (a whole entry, or a blank-line paragraph inside one) is redacted wherever it appears in an injected system section. That is the whole system prompt string, so the same piece is also removed from SOUL, AGENTS.md, or skills text when those sections contain it. Shorter pieces are left alone. The kid's own messages are not redacted. A compaction handoff is the exception in the bullet above.
 - Homework-mode compliance is not measured.
 - `search_files` walks an allowed directory for a symlink that points outside `file_roots` or at the profile home, a credential directory, or a browser profile. The walk refuses past 20000 entries. A path Hermes would split (on commas, or on whitespace when there is no comma) is refused unless every part stays inside `file_roots` and off blocked paths. `target` (`content` or `files`) is not a path; an omitted or blank path is checked as `.`. `read_file` checks the named path only. `terminal` is not covered. Docker and SSH backends were not executed, so a symlink that exists only on those hosts was not checked.
-- `hermes plugins validate` warns on private Hermes imports. The plugin reads the active profile with `hermes_constants.get_hermes_home` and `MEMORY.md` / `USER.md` through `get_memory_dir`, splitting entries on `ENTRY_DELIMITER` itself. The session directory comes from `ctx.session_cwd()`. It does not call `tools.file_tools_paths._resolve_base_dir` or `MemoryStore._parse_entries`. `bench/` imports adapters for measurement. Validation still exits 0. Doctor `--ci` reports no errors.
+- `hermes plugins validate` still warns on one private import: `tools.memory_tool_store.ENTRY_DELIMITER` in `__init__.py` (three sites). That constant is how on-disk `MEMORY.md` / `USER.md` entries are split and joined. Hermes does not export it on a public plugin surface, so the import stays. The plugin does not call `MemoryStore._parse_entries`. Memory files are `get_hermes_home() / "memories"`, the same path `get_memory_dir()` returns. The session directory comes from `ctx.session_cwd()`. `security.allow_private_urls` and the legacy `browser.allow_private_urls` flag are read with `hermes_cli.config.read_raw_config`. Measurement imports stay in `tests/bench_compare.py`, `tests/bench_coexistence.py`, and `tests/bench_demo.py`; `python bench/compare.py`, `python bench/coexistence.py`, and `python bench/demo.py` run those files. Validation still exits 0. Doctor `--ci` reports no errors.
 - No banner or screenshot is shipped.
 
 ## Tests
@@ -210,7 +210,7 @@ hermes plugins validate . --install-deps
 hermes plugins doctor . --ci
 ```
 
-`pytest.ini` already adds `-q`. The override above keeps a single `-q` so the summary line is printed. Validate exited 0 on each interpreter and still warned about private Hermes imports. Doctor `--ci` exited 0 and reported no errors.
+`pytest.ini` already adds `-q`. The override above keeps a single `-q` so the summary line is printed. On that run, validate exited 0 and warned about every private Hermes import it found, including `bench/`. Doctor `--ci` exited 0 and reported no errors. The current tree still exits 0; the remaining private-import warning is only `tools.memory_tool_store.ENTRY_DELIMITER`, listed under Known issues.
 
 | Interpreter | pytest | validate | doctor |
 | --- | --- | --- | --- |
