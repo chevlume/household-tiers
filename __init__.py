@@ -182,10 +182,19 @@ class _SafeFormat(dict):
 
 
 def _home() -> Path:
-    """Active profile home. Same resolver ``get_memory_dir()`` uses."""
+    """Active profile home. ``get_hermes_home()`` is the public resolver."""
     from hermes_constants import get_hermes_home
 
     return Path(get_hermes_home())
+
+
+def _memory_dir() -> Path:
+    """``MEMORY.md`` / ``USER.md`` directory.
+
+    ``tools.memory_tool.get_memory_dir`` is not a public plugin import. Its
+    body is ``get_hermes_home() / "memories"``, which is this path.
+    """
+    return _home() / "memories"
 
 
 def _policy_path() -> Path | None:
@@ -923,10 +932,8 @@ def _split_memory_entries(raw: str) -> list[str]:
 def _memory_file(target: str) -> tuple[list[str], list[str]] | None:
     """Entries and scrub chunks for one memory file. Reused while the file is unchanged."""
     try:
-        from tools.memory_tool import get_memory_dir
-
         name = "USER.md" if target == "user" else "MEMORY.md"
-        path = get_memory_dir() / name
+        path = _memory_dir() / name
         if not path.is_file():
             return None
         st = path.stat()
