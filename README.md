@@ -1,17 +1,45 @@
 # household-tiers
 
-Per-person tool tiers for one shared [Hermes](https://github.com/NousResearch/hermes-agent) bot. People are `owner`, `user`, or `guest`. The `family` preset adds `kid`: a curfew, a parent alert, a fixed homework note, and built-in owner memory (`MEMORY.md` / `USER.md`) withheld from non-owner prompts. An external provider block that Hermes joins after those boxes is removed with them. A provider block with no built-in box in the prompt, and the compaction auxiliary summary, are not filtered.
+Per-person tool tiers (`owner`, `user`, `guest`) for one shared [Hermes](https://github.com/NousResearch/hermes-agent) bot; the `family` preset adds `kid`, with a curfew, a parent alert, a fixed homework note, and built-in owner memory (`MEMORY.md` / `USER.md`) withheld from other prompts.
 
-The gateway enforces this with `post_gateway_admission`, `pre_gateway_dispatch`, `pre_tool_call`, `subagent_start`, `llm_request` middleware, and the `/family` command (`/familia` is the same command registered again; `register_command` has no alias field). A broken policy fails closed.
+## Start in 30 seconds
 
-This release was executed on two Hermes refs, both with CPython **3.14.10**:
+`hermes plugins install household-tiers` does not resolve yet. Clone the repository into the plugins directory and enable it:
 
-| Ref | Commit | What ran |
-| --- | --- | --- |
-| tag `v0.22.7` | `b200f5bc60e31588ba2cb60e288029c4a54ba5fa` | `pytest` (**108 passed**), `hermes plugins validate . --install-deps`, `hermes plugins doctor . --ci` |
-| CI pin | `ed1afb082eb3e46cf2edae9d8f68fb67b09ee4df` (193 commits after that tag) | the same three commands, plus `python bench/compare.py` |
+```bash
+mkdir -p ~/.hermes/plugins
+git clone https://github.com/chevlume/household-tiers.git ~/.hermes/plugins/household-tiers
+```
 
-`requires_hermes` stays `>=0.22.7`. Not tested on Python 3.11, 3.12, or 3.13. GitHub Actions uses `ubuntu-latest` with uv's CPython 3.14 and the CI pin only.
+In `~/.hermes/config.yaml`:
+
+```yaml
+plugins:
+  enabled:
+    - household-tiers
+```
+
+Restart the gateway.
+
+Save this as `~/.hermes/household-tiers.json` (the same file is in [`docs/demo-config.json`](docs/demo-config.json), with fictitious ids):
+
+```json
+{"preset": "family",
+ "users": {"telegram:100001": "owner", "telegram:200002": "kid"},
+ "notify": {"platform": "telegram", "chat_id": "900009"}}
+```
+
+From the owner's chat:
+
+```text
+/family tier telegram:200002 kid
+```
+
+An id that is not in `users` is `guest`.
+
+If Hermes implements native permissions the way [issue #527](https://github.com/NousResearch/hermes-agent/issues/527) asks, this plugin stays as a family layer on top of that system — schedules, a curfew, and a parent alert — rather than becoming that system. It is a plugin, not a core change: it has `owner`, `user`, and `guest` (the `family` preset adds `kid`), and it does not have an `admin` role. #527 is still open and still asks for those native tiers in core, including `admin`.
+
+The official catalog listing is an [open pull request](https://github.com/NousResearch/hermes-agent/pull/149578) waiting for maintainer review.
 
 ## Install
 
@@ -35,20 +63,6 @@ plugins:
 Restart the gateway. The plugin is standard-library Python only. It declares no Python dependencies. `bench/compare.py` is separate and needs `tiktoken` (`pip install tiktoken`). It exits if tiktoken is missing.
 
 ## Quick start
-
-Save this as `~/.hermes/household-tiers.json` (the same file is in [`docs/demo-config.json`](docs/demo-config.json), with fictitious ids):
-
-```json
-{"preset": "family",
- "users": {"telegram:100001": "owner", "telegram:200002": "kid"},
- "notify": {"platform": "telegram", "chat_id": "900009"}}
-```
-
-Add someone later, from the owner's chat, in one line:
-
-```text
-/family tier telegram:200002 kid
-```
 
 An id that is not in `users` is `guest`: no tools, no owner memory, and the same curfew as `kid` under the family preset. The policy file is reread when its inode, mtime, or size changes, including the next call after an edit.
 
@@ -186,13 +200,28 @@ Files left by the previous filename are not read. The changelog has those names 
 
 ## Tests
 
-CI installs Hermes at `ed1afb082eb3e46cf2edae9d8f68fb67b09ee4df` and runs the same commands that were also run locally on tag `v0.22.7` (`b200f5bc60e31588ba2cb60e288029c4a54ba5fa`):
+These commands were run on Hermes commit `ed1afb082eb3e46cf2edae9d8f68fb67b09ee4df` (the CI pin). Tag `v0.22.7` (`b200f5bc60e31588ba2cb60e288029c4a54ba5fa`) was not re-run: that tag's lock has the same supported environment, `python_full_version >= '3.14'`, so a second pin would repeat the same dependency set. `requires_hermes` stays `>=0.22.7`.
+
+`uv sync --locked --python 3.14` installs that pin. The same command on 3.11, 3.12, and 3.13 stops with `The current Python platform is not compatible with the lockfile's supported environments: python_full_version >= '3.14'`. The wheels from the 3.14 lock do install on those interpreters. Each of 3.11, 3.12, and 3.13 used `uv pip freeze` of the locked 3.14 environment, then `uv pip install -r` of that list and `uv pip install -e` of the Hermes checkout with `--no-deps`. Interpreters were uv's CPython.
 
 ```bash
-pytest -q
+python -m pytest --override-ini addopts= -q --tb=line
 hermes plugins validate . --install-deps
 hermes plugins doctor . --ci
 ```
+
+`pytest.ini` already adds `-q`. The override above keeps a single `-q` so the summary line is printed. Validate exited 0 on each interpreter and still warned about private Hermes imports. Doctor `--ci` exited 0 and reported no errors.
+
+| Interpreter | pytest | validate | doctor |
+| --- | --- | --- | --- |
+| CPython 3.11.18 | 108 passed, 0 failed, 0 skipped | exit 0 | exit 0 |
+| CPython 3.12.16 | 108 passed, 0 failed, 0 skipped | exit 0 | exit 0 |
+| CPython 3.13.18 | 108 passed, 0 failed, 0 skipped, 44 warnings | exit 0 | exit 0 |
+| CPython 3.14.10 | 108 passed, 0 failed, 0 skipped, 44 warnings | exit 0 | exit 0 |
+
+The 44 warnings are `DeprecationWarning` from Hermes `hermes_cli/plugins_manifest.py` (`re.split` `maxsplit` passed positionally). Pytest printed no warning summary on 3.11 or 3.12. `python bench/compare.py` and `python bench/coexistence.py` were not part of this matrix.
+
+GitHub Actions uses `ubuntu-latest`, this CI pin, and uv CPython 3.11, 3.12, 3.13, and 3.14. The 3.14 job is `uv sync --locked`. The other three jobs install that lock's frozen wheels into the job's interpreter, as above.
 
 The catalog draft is `catalog/household-tiers.yaml`. Its `sha` field has to be updated to the commit you submit. Image and banner are intentionally absent.
 
